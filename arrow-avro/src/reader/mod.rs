@@ -1471,7 +1471,11 @@ impl<R: BufRead> RecordBatchReader for Reader<R> {
 
 #[cfg(test)]
 mod test {
-    use crate::codec::{AvroFieldBuilder, Tz};
+    use crate::codec::AvroFieldBuilder;
+    // Used only by tests that are gated on the `snappy` feature (the fixtures they
+    // exercise happen to be Snappy-compressed); keep the import scoped accordingly.
+    #[cfg(feature = "snappy")]
+    use crate::codec::Tz;
     use crate::errors::AvroError;
     use crate::reader::header::HeaderDecoder;
     use crate::reader::record::RecordDecoder;
@@ -3424,6 +3428,10 @@ mod test {
         );
     }
 
+    // alltypes_plain.avro uses snappy compression internally; gate accordingly.
+    // TODO: avoid requiring snappy for this file (matches the pattern used by sibling
+    // tests in this module).
+    #[cfg(feature = "snappy")]
     #[test]
     fn test_timestamp_with_utc_tz() {
         let path = arrow_test_data("avro/alltypes_plain.avro");
@@ -7133,6 +7141,8 @@ mod test {
         );
     }
 
+    // Reads a gzipped fixture, so requires the `deflate` feature (which pulls in `flate2`).
+    #[cfg(feature = "deflate")]
     #[test]
     fn test_bad_varint_bug_nullable_array_items() {
         use flate2::read::GzDecoder;
