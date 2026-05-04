@@ -45,7 +45,7 @@ sha256 = ["dep:sha2"]
 small_decimals = []
 avro_custom_types = ["dep:arrow-select"]
 # Enable async APIs
-async = ["tokio", "futures"]
+async = ["dep:tokio", "dep:futures"]
 # Enable object_store integration
 object_store = ["dep:object_store", "async"]
 
@@ -55,7 +55,7 @@ arrow-buffer = { workspace = true }
 arrow-array = { workspace = true }
 arrow-select = { workspace = true, optional = true }
 
-object_store = { workspace = true, optional = true }
+object_store = { workspace = true, optional = true, features = ["tokio"] }
 
 bytes = { version = "1.11.0", default-features = false, features = ["std"] }
 serde_json = { version = "1.0", default-features = false, features = ["std"] }

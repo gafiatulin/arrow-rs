@@ -128,9 +128,9 @@
 //! The [`reader`] module provides async APIs for reading Avro files when the `async`
 //! feature is enabled.
 //!
-//! [`AsyncAvroFileReader`] implements `Stream<Item = Result<RecordBatch, ArrowError>>`,
+//! `AsyncAvroFileReader` implements `Stream<Item = Result<RecordBatch, ArrowError>>`,
 //! allowing efficient async streaming of record batches. When the `object_store` feature
-//! is enabled, [`AvroObjectReader`] provides integration with object storage services
+//! is enabled, `AvroObjectReader` provides integration with object storage services
 //! such as S3 via the [object_store] crate.
 //!
 //! ```ignore
@@ -163,15 +163,12 @@
 //! ### Modules
 //!
 //! - [`reader`]: read Avro (OCF, SOE, Confluent) into Arrow `RecordBatch`es.
-//!   - With the `async` feature: [`AsyncAvroFileReader`] for async streaming reads.
-//!   - With the `object_store` feature: [`AvroObjectReader`] for reading from cloud storage.
+//!   - With the `async` feature: `AsyncAvroFileReader` for async streaming reads.
+//!   - With the `object_store` feature: `AvroObjectReader` for reading from cloud storage.
 //! - [`writer`]: write Arrow `RecordBatch`es as Avro (OCF, SOE, Confluent, Apicurio).
 //! - [`schema`]: Avro schema parsing / fingerprints / registries.
 //! - [`compression`]: codecs used for **OCF block compression** (i.e., Deflate, Snappy, Zstandard, BZip2, and XZ).
 //! - [`codec`]: internal Avro-Arrow type conversion and row decode/encode plans.
-//!
-//! [`AsyncAvroFileReader`]: reader::AsyncAvroFileReader
-//! [`AvroObjectReader`]: reader::AvroObjectReader
 //!
 //! ### Features
 //!
