@@ -152,6 +152,8 @@ use crate::schema::{
 use crate::writer::encoder::{RecordEncoder, RecordEncoderBuilder, write_long};
 use crate::writer::format::{AvroFormat, AvroOcfFormat, AvroSoeFormat};
 use arrow_array::RecordBatch;
+#[cfg(feature = "async")]
+use arrow_schema::ArrowError;
 use arrow_schema::{Schema, SchemaRef};
 use bytes::{Bytes, BytesMut};
 use std::io::Write;
@@ -167,9 +169,10 @@ pub mod format;
 pub mod async_writer;
 
 #[cfg(feature = "async")]
-pub use async_writer::{
-    AsyncAvroStreamWriter, AsyncAvroWriter, AsyncFileWriter, AsyncWriter, AsyncWriterBuilder,
-};
+pub use async_writer::{AsyncAvroStreamWriter, AsyncAvroWriter, AsyncFileWriter, AsyncWriter};
+
+#[cfg(feature = "object_store")]
+pub use async_writer::AvroObjectWriter;
 
 /// A contiguous set of Avro encoded rows.
 ///
@@ -322,6 +325,11 @@ impl EncodedRows {
     }
 }
 
+/// Default OCF block size (in bytes) used when none is specified.
+///
+/// Matches the default `syncInterval` used by the Avro reference Java implementation.
+pub const DEFAULT_BLOCK_SIZE: usize = 64 * 1024;
+
 /// Builder to configure and create a `Writer`.
 #[derive(Debug, Clone)]
 pub struct WriterBuilder {
@@ -329,6 +337,7 @@ pub struct WriterBuilder {
     codec: Option<CompressionCodec>,
     row_capacity: Option<usize>,
     capacity: usize,
+    block_size: usize,
     fingerprint_strategy: Option<FingerprintStrategy>,
 }
 
@@ -336,7 +345,7 @@ impl WriterBuilder {
     /// Create a new builder with default settings.
     ///
     /// The Avro schema used for writing is determined as follows:
-    /// 1) If the Arrow schema metadata contains `avro::schema` (see `SCHEMA_METADATA_KEY`),
+    /// 1) If the Arrow schema metadata contains `avro.schema` (see [`SCHEMA_METADATA_KEY`]),
     ///    that JSON is used verbatim.
     /// 2) Otherwise, the Arrow schema is converted to an Avro record schema.
     pub fn new(schema: Schema) -> Self {
@@ -345,6 +354,7 @@ impl WriterBuilder {
             codec: None,
             row_capacity: None,
             capacity: 1024,
+            block_size: DEFAULT_BLOCK_SIZE,
             fingerprint_strategy: None,
         }
     }
@@ -376,6 +386,23 @@ impl WriterBuilder {
     /// It is used as a hint to reduce reallocations when the typical encoded row size is known.
     pub fn with_row_capacity(mut self, capacity: usize) -> Self {
         self.row_capacity = Some(capacity);
+        self
+    }
+
+    /// Sets the target Avro Object Container File (OCF) block size in bytes.
+    ///
+    /// The writer accumulates encoded rows into a staging buffer and emits a new OCF block
+    /// once the buffer reaches this size, rather than flushing one block per [`RecordBatch`].
+    /// Larger blocks improve compression ratios and reduce per-block framing overhead, while
+    /// smaller blocks reduce read latency for filtered scans.
+    ///
+    /// A value of `0` restores the legacy behavior of writing one block per call to
+    /// [`Writer::write`]. The default is [`DEFAULT_BLOCK_SIZE`] (matches Avro Java's
+    /// default `syncInterval`).
+    ///
+    /// This setting only applies to OCF writers; it is ignored by stream formats.
+    pub fn with_block_size(mut self, block_size: usize) -> Self {
+        self.block_size = block_size;
         self
     }
 
@@ -452,9 +479,53 @@ impl WriterBuilder {
             schema,
             format,
             compression: self.codec,
-            capacity: self.capacity,
+            block_size: self.block_size,
             encoder,
+            block_buf: Vec::with_capacity(self.capacity),
+            block_rows: 0,
         })
+    }
+
+    /// Build an asynchronous [`AsyncWriter`] with the specified [`AvroFormat`].
+    ///
+    /// This is the async counterpart of [`build`](Self::build); all builder settings
+    /// (compression, capacity, block size, fingerprint strategy) apply identically.
+    /// The encoder is fully validated before any bytes are written, so a failure here
+    /// will not leave a partial stream on the sink.
+    #[cfg(feature = "async")]
+    pub async fn build_async<W, F>(
+        self,
+        mut writer: W,
+    ) -> Result<crate::writer::async_writer::AsyncWriter<W, F>, ArrowError>
+    where
+        W: crate::writer::async_writer::AsyncFileWriter,
+        F: AvroFormat,
+    {
+        let mut format = F::default();
+        if format.sync_marker().is_none() && !F::NEEDS_PREFIX {
+            return Err(ArrowError::InvalidArgumentError(
+                "AvroBinaryFormat is only supported with Encoder, use build_encoder instead"
+                    .to_string(),
+            ));
+        }
+        let (schema, encoder) = self.prepare_encoder::<F>()?;
+        // Compose the header bytes synchronously, then push to the async sink.
+        // Encoder is already validated above, so a header write that fails on the
+        // sink only leaves data the caller can choose to discard.
+        let mut header_buf = Vec::<u8>::with_capacity(256);
+        format.start_stream(&mut header_buf, &schema, self.codec)?;
+        if !header_buf.is_empty() {
+            writer.write(bytes::Bytes::from(header_buf)).await?;
+        }
+        Ok(crate::writer::async_writer::AsyncWriter::from_parts(
+            writer,
+            schema,
+            format,
+            self.codec,
+            self.block_size,
+            self.capacity,
+            encoder,
+        ))
     }
 }
 /// A row-by-row encoder for Avro *stream/message* formats (SOE / registry wire formats / raw binary).
@@ -574,8 +645,13 @@ pub struct Writer<W: Write, F: AvroFormat> {
     schema: SchemaRef,
     format: F,
     compression: Option<CompressionCodec>,
-    capacity: usize,
+    block_size: usize,
     encoder: RecordEncoder,
+    /// Staging buffer holding the encoded bytes of an in-progress OCF block.
+    /// Always empty for non-OCF formats.
+    block_buf: Vec<u8>,
+    /// Number of rows currently accumulated in `block_buf`.
+    block_rows: usize,
 }
 
 /// Alias for an Avro **Object Container File** writer.
@@ -746,26 +822,53 @@ impl<W: Write, F: AvroFormat> Writer<W, F> {
         Ok(())
     }
 
-    /// Flush remaining buffered data and (for OCF) ensure the header is present.
+    /// Flush any pending OCF block and the underlying writer.
+    ///
+    /// This emits any rows accumulated by [`with_block_size`](WriterBuilder::with_block_size)
+    /// that have not yet reached the configured block-size threshold, then flushes
+    /// the underlying [`Write`].
     pub fn finish(&mut self) -> Result<(), AvroError> {
+        if let Some(sync) = self.format.sync_marker().copied() {
+            self.flush_block(&sync)?;
+        }
         self.writer
             .flush()
             .map_err(|e| AvroError::IoError(format!("Error flushing writer: {e}"), e))
     }
 
     /// Consume the writer, returning the underlying output object.
+    ///
+    /// Note: any rows still buffered in an in-progress OCF block are dropped.
+    /// Call [`finish`](Self::finish) first to ensure all data is written.
     pub fn into_inner(self) -> W {
         self.writer
     }
 
     fn write_ocf_block(&mut self, batch: &RecordBatch, sync: &[u8; 16]) -> Result<(), AvroError> {
-        let mut buf = Vec::<u8>::with_capacity(self.capacity);
-        self.encoder.encode(&mut buf, batch)?;
+        // Encode the batch's rows into the block staging buffer and accumulate row count.
+        // The block is flushed once it reaches `block_size` (or on `finish()`); this
+        // avoids emitting one tiny block per RecordBatch, which would compress poorly
+        // and add per-block framing overhead.
+        self.encoder.encode(&mut self.block_buf, batch)?;
+        self.block_rows += batch.num_rows();
+        if self.block_buf.len() >= self.block_size {
+            self.flush_block(sync)?;
+        }
+        Ok(())
+    }
+
+    /// Emit the currently accumulated OCF block, applying compression and writing
+    /// header (row count + byte count), block bytes, and sync marker.
+    /// No-op if no rows are accumulated.
+    fn flush_block(&mut self, sync: &[u8; 16]) -> Result<(), AvroError> {
+        if self.block_rows == 0 {
+            return Ok(());
+        }
         let encoded = match self.compression {
-            Some(codec) => codec.compress(&buf)?,
-            None => buf,
+            Some(codec) => codec.compress(&self.block_buf)?,
+            None => std::mem::take(&mut self.block_buf),
         };
-        write_long(&mut self.writer, batch.num_rows() as i64)?;
+        write_long(&mut self.writer, self.block_rows as i64)?;
         write_long(&mut self.writer, encoded.len() as i64)?;
         self.writer
             .write_all(&encoded)
@@ -773,6 +876,10 @@ impl<W: Write, F: AvroFormat> Writer<W, F> {
         self.writer
             .write_all(sync)
             .map_err(|e| AvroError::IoError(format!("Error writing Avro sync: {e}"), e))?;
+        // Reset block state. If compression was applied, `block_buf` was not moved,
+        // so clear it explicitly to drop the encoded source bytes.
+        self.block_buf.clear();
+        self.block_rows = 0;
         Ok(())
     }
 
@@ -1999,7 +2106,10 @@ mod tests {
         let mut writer = WriterBuilder::new(make_schema())
             .with_capacity(cap)
             .build::<_, AvroOcfFormat>(buffer)?;
-        assert_eq!(writer.capacity, cap, "builder capacity not propagated");
+        assert!(
+            writer.block_buf.capacity() >= cap,
+            "builder capacity not propagated to OCF block buffer"
+        );
         let batch = make_batch();
         writer.write(&batch)?;
         writer.finish()?;
@@ -2009,7 +2119,7 @@ mod tests {
     }
 
     #[test]
-    fn test_stream_writer_stores_capacity_direct_writes() -> Result<(), AvroError> {
+    fn test_stream_writer_writes_direct_with_capacity_hint() -> Result<(), AvroError> {
         use arrow_array::{ArrayRef, Int32Array};
         use arrow_schema::{DataType, Field, Schema};
         let schema = Schema::new(vec![Field::new("a", DataType::Int32, false)]);
@@ -2017,13 +2127,15 @@ mod tests {
             Arc::new(schema.clone()),
             vec![Arc::new(Int32Array::from(vec![1, 2, 3])) as ArrayRef],
         )?;
-        let cap = 8192;
+        // SOE/stream writers encode straight to the sink, so `with_capacity` is
+        // effectively a no-op here. Ensure the builder still accepts it and produces
+        // a writable stream.
         let mut writer = WriterBuilder::new(schema)
-            .with_capacity(cap)
+            .with_capacity(8192)
             .build::<_, AvroSoeFormat>(Vec::new())?;
-        assert_eq!(writer.capacity, cap);
         writer.write(&batch)?;
-        let _bytes = writer.into_inner();
+        let bytes = writer.into_inner();
+        assert!(!bytes.is_empty());
         Ok(())
     }
 
