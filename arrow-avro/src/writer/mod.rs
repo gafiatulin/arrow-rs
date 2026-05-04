@@ -1369,11 +1369,11 @@ mod tests {
             let codec = if rel.contains(".snappy.") {
                 Some(CompressionCodec::Snappy)
             } else if rel.contains(".zstandard.") {
-                Some(CompressionCodec::ZStandard)
+                Some(CompressionCodec::ZStandard(Default::default()))
             } else if rel.contains(".bzip2.") {
-                Some(CompressionCodec::Bzip2)
+                Some(CompressionCodec::Bzip2(Default::default()))
             } else if rel.contains(".xz.") {
-                Some(CompressionCodec::Xz)
+                Some(CompressionCodec::Xz(Default::default()))
             } else {
                 None
             };

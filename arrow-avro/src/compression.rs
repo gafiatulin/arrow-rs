@@ -28,22 +28,170 @@ use std::io::{Read, Write};
 /// The metadata key used for storing the JSON encoded [`CompressionCodec`]
 pub const CODEC_METADATA_KEY: &str = "avro.codec";
 
+/// Defines a valid range of compression levels for a codec.
+trait CompressionLevel<T: std::fmt::Display + std::cmp::PartialOrd> {
+    const MINIMUM_LEVEL: T;
+    const MAXIMUM_LEVEL: T;
+
+    fn is_valid_level(level: T) -> Result<(), ArrowError> {
+        let range = Self::MINIMUM_LEVEL..=Self::MAXIMUM_LEVEL;
+        if range.contains(&level) {
+            Ok(())
+        } else {
+            Err(ArrowError::InvalidArgumentError(format!(
+                "compression level {} out of range {}..={}",
+                level,
+                range.start(),
+                range.end()
+            )))
+        }
+    }
+}
+
+/// Compression level for [`CompressionCodec::Deflate`].
+///
+/// Range `0..=9`. Higher values produce smaller output at the cost of speed.
+/// `0` disables compression. The default of `6` matches the `flate2` /
+/// `miniz_oxide` backend default.
+#[derive(Debug, Eq, PartialEq, Hash, Clone, Copy)]
+pub struct DeflateLevel(u32);
+
+impl CompressionLevel<u32> for DeflateLevel {
+    const MINIMUM_LEVEL: u32 = 0;
+    const MAXIMUM_LEVEL: u32 = 9;
+}
+
+impl Default for DeflateLevel {
+    fn default() -> Self {
+        Self(6)
+    }
+}
+
+impl DeflateLevel {
+    /// Try to construct a [`DeflateLevel`] from a raw `u32` in `0..=9`.
+    pub fn try_new(level: u32) -> Result<Self, ArrowError> {
+        Self::is_valid_level(level).map(|_| Self(level))
+    }
+
+    /// Returns the raw level value.
+    pub fn compression_level(&self) -> u32 {
+        self.0
+    }
+}
+
+/// Compression level for [`CompressionCodec::ZStandard`].
+///
+/// Range `1..=22`. The default of `3` matches the `zstd` library default
+/// (the level previously implied by passing `0` to `zstd::Encoder::new`).
+#[derive(Debug, Eq, PartialEq, Hash, Clone, Copy)]
+pub struct ZstdLevel(i32);
+
+impl CompressionLevel<i32> for ZstdLevel {
+    const MINIMUM_LEVEL: i32 = 1;
+    const MAXIMUM_LEVEL: i32 = 22;
+}
+
+impl Default for ZstdLevel {
+    fn default() -> Self {
+        Self(3)
+    }
+}
+
+impl ZstdLevel {
+    /// Try to construct a [`ZstdLevel`] from a raw `i32` in `1..=22`.
+    pub fn try_new(level: i32) -> Result<Self, ArrowError> {
+        Self::is_valid_level(level).map(|_| Self(level))
+    }
+
+    /// Returns the raw level value.
+    pub fn compression_level(&self) -> i32 {
+        self.0
+    }
+}
+
+/// Compression level for [`CompressionCodec::Bzip2`].
+///
+/// Range `1..=9`. Each step represents a 100 KiB block-size increment.
+/// The default of `9` matches Avro Java (which uses
+/// `BZip2CompressorOutputStream`'s no-arg constructor = `MAX_BLOCKSIZE`)
+/// and the `bzip2` CLI's default of `-9`.
+#[derive(Debug, Eq, PartialEq, Hash, Clone, Copy)]
+pub struct Bzip2Level(u32);
+
+impl CompressionLevel<u32> for Bzip2Level {
+    const MINIMUM_LEVEL: u32 = 1;
+    const MAXIMUM_LEVEL: u32 = 9;
+}
+
+impl Default for Bzip2Level {
+    fn default() -> Self {
+        Self(9)
+    }
+}
+
+impl Bzip2Level {
+    /// Try to construct a [`Bzip2Level`] from a raw `u32` in `1..=9`.
+    pub fn try_new(level: u32) -> Result<Self, ArrowError> {
+        Self::is_valid_level(level).map(|_| Self(level))
+    }
+
+    /// Returns the raw level value.
+    pub fn compression_level(&self) -> u32 {
+        self.0
+    }
+}
+
+/// Compression level for [`CompressionCodec::Xz`].
+///
+/// Range `0..=9`. The default of `6` matches the `xz` / `liblzma` default.
+#[derive(Debug, Eq, PartialEq, Hash, Clone, Copy)]
+pub struct XzLevel(u32);
+
+impl CompressionLevel<u32> for XzLevel {
+    const MINIMUM_LEVEL: u32 = 0;
+    const MAXIMUM_LEVEL: u32 = 9;
+}
+
+impl Default for XzLevel {
+    fn default() -> Self {
+        Self(6)
+    }
+}
+
+impl XzLevel {
+    /// Try to construct an [`XzLevel`] from a raw `u32` in `0..=9`.
+    pub fn try_new(level: u32) -> Result<Self, ArrowError> {
+        Self::is_valid_level(level).map(|_| Self(level))
+    }
+
+    /// Returns the raw level value.
+    pub fn compression_level(&self) -> u32 {
+        self.0
+    }
+}
+
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
 /// Supported compression codecs for Avro data
 ///
 /// Avro supports multiple compression formats for data blocks.
 /// This enum represents the compression codecs available in this implementation.
+///
+/// Codecs that take a compression level carry a typed level wrapper
+/// (e.g. [`DeflateLevel`]). Use the `Default` impl on those wrappers to
+/// get the codec's natural default level. The compression level is a
+/// writer-side choice — it is not persisted in the OCF metadata, so the
+/// reader does not need to know what level was used to compress a block.
 pub enum CompressionCodec {
     /// Deflate compression (RFC 1951)
-    Deflate,
+    Deflate(DeflateLevel),
     /// Snappy compression
     Snappy,
     /// ZStandard compression
-    ZStandard,
+    ZStandard(ZstdLevel),
     /// Bzip2 compression
-    Bzip2,
+    Bzip2(Bzip2Level),
     /// Xz compression
-    Xz,
+    Xz(XzLevel),
 }
 
 impl CompressionCodec {
@@ -51,14 +199,14 @@ impl CompressionCodec {
     pub(crate) fn decompress(&self, block: &[u8]) -> Result<Vec<u8>, AvroError> {
         match self {
             #[cfg(feature = "deflate")]
-            CompressionCodec::Deflate => {
+            CompressionCodec::Deflate(_) => {
                 let mut decoder = flate2::read::DeflateDecoder::new(block);
                 let mut out = Vec::new();
                 decoder.read_to_end(&mut out)?;
                 Ok(out)
             }
             #[cfg(not(feature = "deflate"))]
-            CompressionCodec::Deflate => Err(AvroError::ParseError(
+            CompressionCodec::Deflate(_) => Err(AvroError::ParseError(
                 "Deflate codec requires deflate feature".to_string(),
             )),
             #[cfg(feature = "snappy")]
@@ -85,7 +233,7 @@ impl CompressionCodec {
             )),
 
             #[cfg(feature = "zstd")]
-            CompressionCodec::ZStandard => {
+            CompressionCodec::ZStandard(_) => {
                 let mut decoder = zstd::Decoder::new(block)?;
                 let mut out = Vec::new();
                 decoder
@@ -94,11 +242,11 @@ impl CompressionCodec {
                 Ok(out)
             }
             #[cfg(not(feature = "zstd"))]
-            CompressionCodec::ZStandard => Err(AvroError::ParseError(
+            CompressionCodec::ZStandard(_) => Err(AvroError::ParseError(
                 "ZStandard codec requires zstd feature".to_string(),
             )),
             #[cfg(feature = "bzip2")]
-            CompressionCodec::Bzip2 => {
+            CompressionCodec::Bzip2(_) => {
                 let mut decoder = bzip2::read::BzDecoder::new(block);
                 let mut out = Vec::new();
                 decoder
@@ -107,11 +255,11 @@ impl CompressionCodec {
                 Ok(out)
             }
             #[cfg(not(feature = "bzip2"))]
-            CompressionCodec::Bzip2 => Err(AvroError::ParseError(
+            CompressionCodec::Bzip2(_) => Err(AvroError::ParseError(
                 "Bzip2 codec requires bzip2 feature".to_string(),
             )),
             #[cfg(feature = "xz")]
-            CompressionCodec::Xz => {
+            CompressionCodec::Xz(_) => {
                 let mut decoder = xz::read::XzDecoder::new(block);
                 let mut out = Vec::new();
                 decoder
@@ -120,7 +268,7 @@ impl CompressionCodec {
                 Ok(out)
             }
             #[cfg(not(feature = "xz"))]
-            CompressionCodec::Xz => Err(AvroError::ParseError(
+            CompressionCodec::Xz(_) => Err(AvroError::ParseError(
                 "XZ codec requires xz feature".to_string(),
             )),
         }
@@ -130,15 +278,17 @@ impl CompressionCodec {
     pub(crate) fn compress(&self, data: &[u8]) -> Result<Vec<u8>, ArrowError> {
         match self {
             #[cfg(feature = "deflate")]
-            CompressionCodec::Deflate => {
-                let mut encoder =
-                    flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::default());
+            CompressionCodec::Deflate(level) => {
+                let mut encoder = flate2::write::DeflateEncoder::new(
+                    Vec::new(),
+                    flate2::Compression::new(level.compression_level()),
+                );
                 encoder.write_all(data)?;
                 let compressed = encoder.finish()?;
                 Ok(compressed)
             }
             #[cfg(not(feature = "deflate"))]
-            CompressionCodec::Deflate => Err(ArrowError::ParseError(
+            CompressionCodec::Deflate(_) => Err(ArrowError::ParseError(
                 "Deflate codec requires deflate feature".to_string(),
             )),
 
@@ -160,8 +310,8 @@ impl CompressionCodec {
             )),
 
             #[cfg(feature = "zstd")]
-            CompressionCodec::ZStandard => {
-                let mut encoder = zstd::Encoder::new(Vec::new(), 0)
+            CompressionCodec::ZStandard(level) => {
+                let mut encoder = zstd::Encoder::new(Vec::new(), level.compression_level())
                     .map_err(|e| ArrowError::ExternalError(Box::new(e)))?;
                 encoder.write_all(data)?;
                 let compressed = encoder
@@ -170,33 +320,105 @@ impl CompressionCodec {
                 Ok(compressed)
             }
             #[cfg(not(feature = "zstd"))]
-            CompressionCodec::ZStandard => Err(ArrowError::ParseError(
+            CompressionCodec::ZStandard(_) => Err(ArrowError::ParseError(
                 "ZStandard codec requires zstd feature".to_string(),
             )),
 
             #[cfg(feature = "bzip2")]
-            CompressionCodec::Bzip2 => {
-                let mut encoder =
-                    bzip2::write::BzEncoder::new(Vec::new(), bzip2::Compression::default());
+            CompressionCodec::Bzip2(level) => {
+                let mut encoder = bzip2::write::BzEncoder::new(
+                    Vec::new(),
+                    bzip2::Compression::new(level.compression_level()),
+                );
                 encoder.write_all(data)?;
                 let compressed = encoder.finish()?;
                 Ok(compressed)
             }
             #[cfg(not(feature = "bzip2"))]
-            CompressionCodec::Bzip2 => Err(ArrowError::ParseError(
+            CompressionCodec::Bzip2(_) => Err(ArrowError::ParseError(
                 "Bzip2 codec requires bzip2 feature".to_string(),
             )),
             #[cfg(feature = "xz")]
-            CompressionCodec::Xz => {
-                let mut encoder = xz::write::XzEncoder::new(Vec::new(), 6);
+            CompressionCodec::Xz(level) => {
+                let mut encoder = xz::write::XzEncoder::new(Vec::new(), level.compression_level());
                 encoder.write_all(data)?;
                 let compressed = encoder.finish()?;
                 Ok(compressed)
             }
             #[cfg(not(feature = "xz"))]
-            CompressionCodec::Xz => Err(ArrowError::ParseError(
+            CompressionCodec::Xz(_) => Err(ArrowError::ParseError(
                 "XZ codec requires xz feature".to_string(),
             )),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn deflate_level_range() {
+        assert_eq!(DeflateLevel::default().compression_level(), 6);
+        assert_eq!(DeflateLevel::try_new(0).unwrap().compression_level(), 0);
+        assert_eq!(DeflateLevel::try_new(9).unwrap().compression_level(), 9);
+        assert!(DeflateLevel::try_new(10).is_err());
+    }
+
+    #[test]
+    fn zstd_level_range() {
+        assert_eq!(ZstdLevel::default().compression_level(), 3);
+        assert!(ZstdLevel::try_new(0).is_err());
+        assert_eq!(ZstdLevel::try_new(1).unwrap().compression_level(), 1);
+        assert_eq!(ZstdLevel::try_new(22).unwrap().compression_level(), 22);
+        assert!(ZstdLevel::try_new(23).is_err());
+    }
+
+    #[test]
+    fn bzip2_level_range() {
+        assert_eq!(Bzip2Level::default().compression_level(), 9);
+        assert!(Bzip2Level::try_new(0).is_err());
+        assert_eq!(Bzip2Level::try_new(1).unwrap().compression_level(), 1);
+        assert_eq!(Bzip2Level::try_new(9).unwrap().compression_level(), 9);
+        assert!(Bzip2Level::try_new(10).is_err());
+    }
+
+    #[test]
+    fn xz_level_range() {
+        assert_eq!(XzLevel::default().compression_level(), 6);
+        assert_eq!(XzLevel::try_new(0).unwrap().compression_level(), 0);
+        assert_eq!(XzLevel::try_new(9).unwrap().compression_level(), 9);
+        assert!(XzLevel::try_new(10).is_err());
+    }
+
+    /// Higher deflate levels should produce strictly-no-larger output than
+    /// lower levels on data with redundancy. Round-tripping at any level
+    /// must yield identical bytes.
+    #[cfg(feature = "deflate")]
+    #[test]
+    fn deflate_levels_produce_smaller_output_at_higher_setting() {
+        // Repeating payload so the level actually matters.
+        let data: Vec<u8> = (0..4096).flat_map(|i: u32| i.to_le_bytes()).collect();
+
+        let fast = CompressionCodec::Deflate(DeflateLevel::try_new(1).unwrap())
+            .compress(&data)
+            .unwrap();
+        let best = CompressionCodec::Deflate(DeflateLevel::try_new(9).unwrap())
+            .compress(&data)
+            .unwrap();
+
+        assert!(
+            best.len() <= fast.len(),
+            "level 9 ({} bytes) should not exceed level 1 ({} bytes)",
+            best.len(),
+            fast.len()
+        );
+
+        for raw in [&fast, &best] {
+            let round_trip = CompressionCodec::Deflate(DeflateLevel::default())
+                .decompress(raw)
+                .unwrap();
+            assert_eq!(round_trip, data);
         }
     }
 }

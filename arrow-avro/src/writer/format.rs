@@ -78,11 +78,11 @@ impl AvroFormat for AvroOcfFormat {
         writer.write_all(b"Obj\x01")?;
         // File metadata map: { "avro.schema": <json>, "avro.codec": <codec> }
         let codec_str = match compression {
-            Some(CompressionCodec::Deflate) => "deflate",
+            Some(CompressionCodec::Deflate(_)) => "deflate",
             Some(CompressionCodec::Snappy) => "snappy",
-            Some(CompressionCodec::ZStandard) => "zstandard",
-            Some(CompressionCodec::Bzip2) => "bzip2",
-            Some(CompressionCodec::Xz) => "xz",
+            Some(CompressionCodec::ZStandard(_)) => "zstandard",
+            Some(CompressionCodec::Bzip2(_)) => "bzip2",
+            Some(CompressionCodec::Xz(_)) => "xz",
             None => "null",
         };
         // Map block: count=2, then key/value pairs, then terminating count=0
