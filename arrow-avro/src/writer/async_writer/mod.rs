@@ -526,7 +526,7 @@ mod tests {
 
         let mut buffer = Vec::new();
         let mut writer = WriterBuilder::new(schema.clone())
-            .with_compression(Some(CompressionCodec::Deflate))
+            .with_compression(Some(CompressionCodec::Deflate(Default::default())))
             .build_async::<_, AvroOcfFormat>(&mut buffer)
             .await?;
 
