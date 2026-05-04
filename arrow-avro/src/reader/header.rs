@@ -107,11 +107,13 @@ impl Header {
         let v = self.get(CODEC_METADATA_KEY);
         match v {
             None | Some(b"null") => Ok(None),
-            Some(b"deflate") => Ok(Some(CompressionCodec::Deflate)),
+            // Decompression doesn't depend on the level the writer chose,
+            // so we use the default level for each codec.
+            Some(b"deflate") => Ok(Some(CompressionCodec::Deflate(Default::default()))),
             Some(b"snappy") => Ok(Some(CompressionCodec::Snappy)),
-            Some(b"zstandard") => Ok(Some(CompressionCodec::ZStandard)),
-            Some(b"bzip2") => Ok(Some(CompressionCodec::Bzip2)),
-            Some(b"xz") => Ok(Some(CompressionCodec::Xz)),
+            Some(b"zstandard") => Ok(Some(CompressionCodec::ZStandard(Default::default()))),
+            Some(b"bzip2") => Ok(Some(CompressionCodec::Bzip2(Default::default()))),
+            Some(b"xz") => Ok(Some(CompressionCodec::Xz(Default::default()))),
             Some(v) => Err(AvroError::ParseError(format!(
                 "Unrecognized compression codec \'{}\'",
                 String::from_utf8_lossy(v)
