@@ -120,6 +120,19 @@ pub trait AsyncFileWriter: Send {
     /// This method should ensure all data is persisted to the underlying storage.
     /// After `complete` returns `Ok(())`, the caller SHOULD NOT call `write` again.
     fn complete(&mut self) -> BoxFuture<'_, Result<(), ArrowError>>;
+
+    /// Abandon any in-flight writes and clean up partially uploaded state.
+    ///
+    /// Implementations backed by multipart uploads (e.g. `AvroObjectWriter`)
+    /// should send the upstream abort here so partial uploads are not billed
+    /// or left lingering. Implementations backed by local sinks (files, in-memory
+    /// buffers) typically have nothing to undo and may leave the default no-op.
+    ///
+    /// `abort` and [`complete`](Self::complete) are mutually exclusive: callers
+    /// should invoke at most one of them on a given writer.
+    fn abort(&mut self) -> BoxFuture<'_, Result<(), ArrowError>> {
+        async move { Ok(()) }.boxed()
+    }
 }
 
 impl AsyncFileWriter for Box<dyn AsyncFileWriter + '_> {
@@ -129,6 +142,10 @@ impl AsyncFileWriter for Box<dyn AsyncFileWriter + '_> {
 
     fn complete(&mut self) -> BoxFuture<'_, Result<(), ArrowError>> {
         self.as_mut().complete()
+    }
+
+    fn abort(&mut self) -> BoxFuture<'_, Result<(), ArrowError>> {
+        self.as_mut().abort()
     }
 }
 
@@ -177,6 +194,10 @@ pub struct AsyncWriter<W: AsyncFileWriter, F: AvroFormat> {
     block_buf: Vec<u8>,
     /// Number of rows currently accumulated in `block_buf`.
     block_rows: usize,
+    /// Total rows handed to the writer since construction.
+    rows_written: u64,
+    /// Number of OCF blocks emitted to the sink. Always 0 for non-OCF formats.
+    blocks_written: u64,
 }
 
 /// Alias for async **Object Container File** writer.
@@ -233,6 +254,8 @@ impl<W: AsyncFileWriter, F: AvroFormat> AsyncWriter<W, F> {
             encoder,
             block_buf: Vec::with_capacity(capacity),
             block_rows: 0,
+            rows_written: 0,
+            blocks_written: 0,
         }
     }
 
@@ -264,11 +287,38 @@ impl<W: AsyncFileWriter, F: AvroFormat> AsyncWriter<W, F> {
     }
 
     /// Flush any pending OCF block and signal end of writing on the underlying sink.
-    pub async fn finish(&mut self) -> Result<(), ArrowError> {
+    ///
+    /// Returns counters describing what was written; for SOE / binary streams
+    /// `blocks_written` is `0`.
+    pub async fn finish(&mut self) -> Result<crate::writer::WriteStats, ArrowError> {
         if let Some(sync) = self.format.sync_marker().copied() {
             self.flush_block(&sync).await?;
         }
-        self.writer.complete().await
+        self.writer.complete().await?;
+        Ok(self.stats())
+    }
+
+    /// Abandon the writer, discarding any in-progress OCF block and asking
+    /// the underlying [`AsyncFileWriter`] to clean up partially written state
+    /// (e.g. abort an in-flight multipart upload).
+    ///
+    /// Use this on the error path instead of [`finish`](Self::finish): unlike
+    /// `finish`, no padding or trailing bytes are sent, and `complete` is not
+    /// invoked. After `abort` the writer is consumed.
+    pub async fn abort(mut self) -> Result<(), ArrowError> {
+        // Drop any staged rows without flushing — the sink should not see a
+        // partial block.
+        self.block_buf.clear();
+        self.block_rows = 0;
+        self.writer.abort().await
+    }
+
+    /// Snapshot of the writer's counters, queryable at any time.
+    pub fn stats(&self) -> crate::writer::WriteStats {
+        crate::writer::WriteStats {
+            rows_written: self.rows_written,
+            blocks_written: self.blocks_written,
+        }
     }
 
     /// Consume the writer and return the underlying async sink.
@@ -289,6 +339,7 @@ impl<W: AsyncFileWriter, F: AvroFormat> AsyncWriter<W, F> {
         // compress poorly and amplify per-block framing overhead.
         self.encoder.encode(&mut self.block_buf, batch)?;
         self.block_rows += batch.num_rows();
+        self.rows_written += batch.num_rows() as u64;
         if self.block_buf.len() >= self.block_size {
             self.flush_block(sync).await?;
         }
@@ -316,13 +367,16 @@ impl<W: AsyncFileWriter, F: AvroFormat> AsyncWriter<W, F> {
         // so clear it explicitly to drop the encoded source bytes.
         self.block_buf.clear();
         self.block_rows = 0;
+        self.blocks_written += 1;
         Ok(())
     }
 
     async fn write_stream(&mut self, batch: &RecordBatch) -> Result<(), ArrowError> {
         let mut buf = Vec::<u8>::new();
         self.encoder.encode(&mut buf, batch)?;
-        self.writer.write(Bytes::from(buf)).await
+        self.writer.write(Bytes::from(buf)).await?;
+        self.rows_written += batch.num_rows() as u64;
+        Ok(())
     }
 }
 
@@ -659,6 +713,118 @@ mod tests {
             "no bytes should have been written when encoder construction fails"
         );
 
+        Ok(())
+    }
+
+    /// `finish()` reports rows + blocks; `stats()` agrees mid-stream.
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_async_writer_finish_returns_stats() -> Result<(), Box<dyn std::error::Error>> {
+        let schema = Schema::new(vec![Field::new("id", DataType::Int64, false)]);
+        // 4 batches × 3 rows = 12 rows. With block_size=0, every batch
+        // becomes its own block, so blocks_written should equal 4.
+        let batches: Vec<RecordBatch> = (0..4)
+            .map(|i| {
+                RecordBatch::try_new(
+                    Arc::new(schema.clone()),
+                    vec![Arc::new(Int64Array::from(vec![i, i + 1, i + 2])) as ArrayRef],
+                )
+                .unwrap()
+            })
+            .collect();
+
+        let mut buffer = Vec::new();
+        let mut writer = WriterBuilder::new(schema)
+            .with_block_size(0)
+            .build_async::<_, AvroOcfFormat>(&mut buffer)
+            .await?;
+        for (i, b) in batches.iter().enumerate() {
+            writer.write(b).await?;
+            let mid = writer.stats();
+            assert_eq!(mid.rows_written, 3 * (i as u64 + 1));
+            assert_eq!(mid.blocks_written, i as u64 + 1);
+        }
+        let stats = writer.finish().await?;
+        assert_eq!(stats.rows_written, 12);
+        assert_eq!(stats.blocks_written, 4);
+        Ok(())
+    }
+
+    /// `abort()` discards staged rows and never calls `complete()` on the sink.
+    /// We verify by routing through a sink that flips a flag on `complete`
+    /// (and another on `abort`), and by confirming bytes from the in-progress
+    /// block are never observed downstream.
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_async_writer_abort_calls_sink_abort()
+    -> Result<(), Box<dyn std::error::Error>> {
+        // Tracking sink: records `complete` and `abort` invocations and the
+        // total bytes received. `Send` is required by `AsyncFileWriter`, so
+        // wrap the trackers in `Arc<Mutex<_>>`.
+        use std::sync::{Arc as SArc, Mutex};
+
+        struct TrackingSink {
+            written: SArc<Mutex<Vec<u8>>>,
+            completed: SArc<Mutex<bool>>,
+            aborted: SArc<Mutex<bool>>,
+        }
+
+        impl AsyncFileWriter for TrackingSink {
+            fn write(&mut self, bs: Bytes) -> BoxFuture<'_, Result<(), ArrowError>> {
+                let written = self.written.clone();
+                Box::pin(async move {
+                    written.lock().unwrap().extend_from_slice(&bs);
+                    Ok(())
+                })
+            }
+            fn complete(&mut self) -> BoxFuture<'_, Result<(), ArrowError>> {
+                let completed = self.completed.clone();
+                Box::pin(async move {
+                    *completed.lock().unwrap() = true;
+                    Ok(())
+                })
+            }
+            fn abort(&mut self) -> BoxFuture<'_, Result<(), ArrowError>> {
+                let aborted = self.aborted.clone();
+                Box::pin(async move {
+                    *aborted.lock().unwrap() = true;
+                    Ok(())
+                })
+            }
+        }
+
+        let schema = Schema::new(vec![Field::new("id", DataType::Int64, false)]);
+        let batch = RecordBatch::try_new(
+            Arc::new(schema.clone()),
+            vec![Arc::new(Int64Array::from(vec![1, 2, 3])) as ArrayRef],
+        )?;
+
+        let written = SArc::new(Mutex::new(Vec::new()));
+        let completed = SArc::new(Mutex::new(false));
+        let aborted = SArc::new(Mutex::new(false));
+        let sink = TrackingSink {
+            written: written.clone(),
+            completed: completed.clone(),
+            aborted: aborted.clone(),
+        };
+
+        let mut writer = AsyncAvroWriter::new(sink, schema).await?;
+        // Header has been written by build_async; capture its size now so we can
+        // assert that abort produced no further bytes.
+        let header_len = written.lock().unwrap().len();
+        writer.write(&batch).await?;
+        // The batch is staged in block_buf (default block_size 64 KiB); abort
+        // should drop it without flushing.
+        writer.abort().await?;
+
+        assert!(*aborted.lock().unwrap(), "sink.abort() should be called");
+        assert!(
+            !*completed.lock().unwrap(),
+            "sink.complete() must NOT be called when abort() is used"
+        );
+        assert_eq!(
+            written.lock().unwrap().len(),
+            header_len,
+            "abort must not flush the in-progress block to the sink"
+        );
         Ok(())
     }
 }
