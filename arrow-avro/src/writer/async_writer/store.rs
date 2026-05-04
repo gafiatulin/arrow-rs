@@ -116,6 +116,14 @@ impl AsyncFileWriter for AvroObjectWriter {
             })
         })
     }
+
+    fn abort(&mut self) -> BoxFuture<'_, Result<(), ArrowError>> {
+        Box::pin(async move {
+            self.w.abort().await.map_err(|e| {
+                ArrowError::ExternalError(Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
+            })
+        })
+    }
 }
 
 #[cfg(test)]
@@ -150,6 +158,30 @@ mod tests {
         let mut reader = ReaderBuilder::new().build(Cursor::new(bytes))?;
         let out = reader.next().unwrap()?;
         assert_eq!(out, batch);
+        Ok(())
+    }
+
+    /// Calling `abort()` before `complete()` must not leave the object behind:
+    /// for the in-memory store, the path simply never appears.
+    #[tokio::test(flavor = "current_thread")]
+    async fn abort_before_complete_leaves_no_object() -> Result<(), Box<dyn std::error::Error>> {
+        let store = Arc::new(InMemory::new()) as Arc<dyn ObjectStore>;
+        let path = Path::from("aborted.avro");
+
+        let schema = Schema::new(vec![Field::new("id", DataType::Int64, false)]);
+        let batch = RecordBatch::try_new(
+            Arc::new(schema.clone()),
+            vec![Arc::new(Int64Array::from(vec![1])) as ArrayRef],
+        )?;
+
+        let sink = AvroObjectWriter::new(Arc::clone(&store), path.clone());
+        let mut writer = AsyncAvroWriter::new(sink, schema).await?;
+        writer.write(&batch).await?;
+        writer.abort().await?;
+
+        // No GET should succeed for the path we aborted.
+        let err = store.get(&path).await.err();
+        assert!(err.is_some(), "object should not exist after abort()");
         Ok(())
     }
 
