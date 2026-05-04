@@ -483,6 +483,8 @@ impl WriterBuilder {
             encoder,
             block_buf: Vec::with_capacity(self.capacity),
             block_rows: 0,
+            rows_written: 0,
+            blocks_written: 0,
         })
     }
 
@@ -652,6 +654,23 @@ pub struct Writer<W: Write, F: AvroFormat> {
     block_buf: Vec<u8>,
     /// Number of rows currently accumulated in `block_buf`.
     block_rows: usize,
+    /// Total rows handed to the writer since construction.
+    rows_written: u64,
+    /// Number of OCF blocks emitted to the sink. Always 0 for non-OCF formats.
+    blocks_written: u64,
+}
+
+/// Counters reported by [`Writer::finish`] / [`AsyncWriter::finish`] (and
+/// queryable mid-stream via [`Writer::stats`] / [`AsyncWriter::stats`]).
+///
+/// `blocks_written` is meaningful only for the OCF format; SOE / binary
+/// streams report `0`.
+#[derive(Debug, Default, Clone, Copy, Eq, PartialEq)]
+pub struct WriteStats {
+    /// Total rows accepted by the writer since construction.
+    pub rows_written: u64,
+    /// Number of OCF blocks emitted to the sink.
+    pub blocks_written: u64,
 }
 
 /// Alias for an Avro **Object Container File** writer.
@@ -826,14 +845,24 @@ impl<W: Write, F: AvroFormat> Writer<W, F> {
     ///
     /// This emits any rows accumulated by [`with_block_size`](WriterBuilder::with_block_size)
     /// that have not yet reached the configured block-size threshold, then flushes
-    /// the underlying [`Write`].
-    pub fn finish(&mut self) -> Result<(), AvroError> {
+    /// the underlying [`Write`]. Returns counters describing what was written; for
+    /// SOE / binary streams `blocks_written` is `0`.
+    pub fn finish(&mut self) -> Result<WriteStats, AvroError> {
         if let Some(sync) = self.format.sync_marker().copied() {
             self.flush_block(&sync)?;
         }
         self.writer
             .flush()
-            .map_err(|e| AvroError::IoError(format!("Error flushing writer: {e}"), e))
+            .map_err(|e| AvroError::IoError(format!("Error flushing writer: {e}"), e))?;
+        Ok(self.stats())
+    }
+
+    /// Snapshot of the writer's counters, queryable at any time.
+    pub fn stats(&self) -> WriteStats {
+        WriteStats {
+            rows_written: self.rows_written,
+            blocks_written: self.blocks_written,
+        }
     }
 
     /// Consume the writer, returning the underlying output object.
@@ -851,6 +880,7 @@ impl<W: Write, F: AvroFormat> Writer<W, F> {
         // and add per-block framing overhead.
         self.encoder.encode(&mut self.block_buf, batch)?;
         self.block_rows += batch.num_rows();
+        self.rows_written += batch.num_rows() as u64;
         if self.block_buf.len() >= self.block_size {
             self.flush_block(sync)?;
         }
@@ -880,11 +910,13 @@ impl<W: Write, F: AvroFormat> Writer<W, F> {
         // so clear it explicitly to drop the encoded source bytes.
         self.block_buf.clear();
         self.block_rows = 0;
+        self.blocks_written += 1;
         Ok(())
     }
 
     fn write_stream(&mut self, batch: &RecordBatch) -> Result<(), AvroError> {
         self.encoder.encode(&mut self.writer, batch)?;
+        self.rows_written += batch.num_rows() as u64;
         Ok(())
     }
 }
@@ -1333,6 +1365,40 @@ mod tests {
         writer.finish()?;
         let out = writer.into_inner();
         assert_eq!(&out[..4], b"Obj\x01", "finish() should emit OCF header");
+        Ok(())
+    }
+
+    #[test]
+    fn test_finish_returns_stats() -> Result<(), AvroError> {
+        let batch = make_batch();
+        let rows = batch.num_rows() as u64;
+        let mut writer = WriterBuilder::new(make_schema())
+            .with_block_size(0)
+            .build::<_, AvroOcfFormat>(Vec::<u8>::new())?;
+        writer.write(&batch)?;
+        let mid = writer.stats();
+        assert_eq!(mid.rows_written, rows);
+        // block_size=0 emits one block per write
+        assert_eq!(mid.blocks_written, 1);
+        writer.write(&batch)?;
+        let stats = writer.finish()?;
+        assert_eq!(stats.rows_written, 2 * rows);
+        assert_eq!(stats.blocks_written, 2);
+        Ok(())
+    }
+
+    #[test]
+    fn test_finish_with_default_block_size_emits_one_block() -> Result<(), AvroError> {
+        // Many small batches at the default 64 KiB block size should coalesce
+        // into a single OCF block, so blocks_written == 1.
+        let mut writer = AvroWriter::new(Vec::<u8>::new(), make_schema())?;
+        let batch = make_batch();
+        for _ in 0..16 {
+            writer.write(&batch)?;
+        }
+        let stats = writer.finish()?;
+        assert_eq!(stats.rows_written, 16 * batch.num_rows() as u64);
+        assert_eq!(stats.blocks_written, 1);
         Ok(())
     }
 
