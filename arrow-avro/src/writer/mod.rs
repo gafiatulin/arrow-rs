@@ -171,8 +171,6 @@ pub mod async_writer;
 #[cfg(feature = "async")]
 pub use async_writer::{AsyncAvroStreamWriter, AsyncAvroWriter, AsyncFileWriter, AsyncWriter};
 
-#[cfg(feature = "object_store")]
-pub use async_writer::AvroObjectWriter;
 
 /// A contiguous set of Avro encoded rows.
 ///
