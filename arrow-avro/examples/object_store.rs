@@ -18,47 +18,51 @@
 use arrow_array::{ArrayRef, Int64Array, RecordBatch};
 use arrow_avro::errors::AvroError;
 use arrow_avro::reader::{AsyncAvroFileReader, AsyncFileReader, SpawnedReader};
-use arrow_avro::writer::AvroWriter;
+use arrow_avro::writer::{AsyncAvroWriter, AsyncFileWriter};
+use arrow_schema::ArrowError;
 use bytes::Bytes;
 use futures::future::BoxFuture;
 use futures::{FutureExt, TryStreamExt};
+use object_store::buffered::BufWriter;
 use object_store::memory::InMemory;
 use object_store::path::Path;
 use object_store::{ObjectStore, ObjectStoreExt};
 use std::error::Error;
 use std::ops::Range;
 use std::sync::Arc;
+use tokio::io::AsyncWriteExt;
 
-/// This example demonstrates reading Avro files from object storage via the
-/// [`object_store`] crate, without the deprecated `AvroObjectReader` type.
+/// This example demonstrates reading and writing Avro files against object storage
+/// via the [`object_store`] crate. `arrow-avro` does not ship a dedicated
+/// `object_store` integration type; instead, implement [`AsyncFileReader`] /
+/// [`AsyncFileWriter`] directly, as shown below.
 ///
 /// # Example Overview
 ///
-/// 1. Writes an Avro Object Container File to an [`ObjectStore`]
+/// 1. Writes an Avro Object Container File to an [`ObjectStore`] with
+///    [`ObjectStoreWriter`], a minimal [`AsyncFileWriter`] implementation on top
+///    of an [`ObjectStore`]
 ///
 /// 2. Reads it back with [`ObjectStoreReader`], a minimal [`AsyncFileReader`]
-///    implementation on top of an [`ObjectStore`] (equivalent of
-///    `AvroObjectReader`)
+///    implementation on top of an [`ObjectStore`]
 ///
 /// 3. Reads it again with the reader wrapped in a [`SpawnedReader`], which
 ///    performs all I/O on a separate tokio runtime so that the runtime
-///    decoding Avro is not also driving the I/O (equivalent of
-///    `AvroObjectReader::with_runtime`)
+///    decoding Avro is not also driving the I/O
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
     let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let path = Path::from("example.avro");
 
-    // 1. Write an Avro Object Container File to the store
+    // 1. Write an Avro Object Container File directly to the store with an
+    // `AsyncFileWriter` implemented on `ObjectStore`.
     let col = Arc::new(Int64Array::from_iter_values([1, 2, 3])) as ArrayRef;
     let batch = RecordBatch::try_from_iter([("col", col)])?;
 
-    let mut writer = AvroWriter::new(Vec::new(), batch.schema().as_ref().clone())?;
-    writer.write(&batch)?;
-    writer.finish()?;
-    store
-        .put(&path, Bytes::from(writer.into_inner()).into())
-        .await?;
+    let sink = ObjectStoreWriter::new(Arc::clone(&store), path.clone());
+    let mut writer = AsyncAvroWriter::new(sink, batch.schema().as_ref().clone()).await?;
+    writer.write(&batch).await?;
+    writer.finish().await?;
 
     // 2. Read it back with an `AsyncFileReader` implemented on `ObjectStore`.
     // The builder requires the file size, which can be obtained via `head`
@@ -90,6 +94,51 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     io_runtime.shutdown_background();
     Ok(())
+}
+
+/// An [`AsyncFileWriter`] for a location in an [`ObjectStore`], writing via
+/// multipart upload. This mirrors the example on the [`AsyncFileWriter`] trait
+/// documentation.
+#[derive(Debug)]
+struct ObjectStoreWriter {
+    w: BufWriter,
+}
+
+impl ObjectStoreWriter {
+    fn new(store: Arc<dyn ObjectStore>, path: Path) -> Self {
+        Self {
+            w: BufWriter::new(store, path),
+        }
+    }
+}
+
+impl AsyncFileWriter for ObjectStoreWriter {
+    fn write(&mut self, bs: Bytes) -> BoxFuture<'_, Result<(), ArrowError>> {
+        async move {
+            self.w.put(bs).await.map_err(|e| {
+                ArrowError::ExternalError(Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
+            })
+        }
+        .boxed()
+    }
+
+    fn complete(&mut self) -> BoxFuture<'_, Result<(), ArrowError>> {
+        async move {
+            self.w.shutdown().await.map_err(|e| {
+                ArrowError::IoError(format!("Error finishing object store upload: {e}"), e)
+            })
+        }
+        .boxed()
+    }
+
+    fn abort(&mut self) -> BoxFuture<'_, Result<(), ArrowError>> {
+        async move {
+            self.w.abort().await.map_err(|e| {
+                ArrowError::ExternalError(Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
+            })
+        }
+        .boxed()
+    }
 }
 
 /// An [`AsyncFileReader`] for a location in an [`ObjectStore`]
