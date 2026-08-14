@@ -70,11 +70,6 @@ use futures::future::{BoxFuture, FutureExt};
 use std::sync::Arc;
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 
-#[cfg(feature = "object_store")]
-pub mod store;
-#[cfg(feature = "object_store")]
-pub use store::AvroObjectWriter;
-
 /// The asynchronous interface used by [`AsyncWriter`] to write Avro files.
 ///
 /// This trait allows [`AsyncWriter`] to be generic over different output destinations,
@@ -97,15 +92,67 @@ pub use store::AvroObjectWriter;
 /// A blanket implementation is provided for all types implementing [`AsyncWrite`] + [`Unpin`] + [`Send`],
 /// which covers common types like `tokio::fs::File`, `tokio::net::TcpStream`, and `Vec<u8>`.
 ///
-/// For custom sinks (e.g., object stores, cloud storage), implement this trait directly.
-#[cfg_attr(
-    feature = "object_store",
-    doc = "See [`AvroObjectWriter`] for a ready-made `object_store` implementation."
-)]
-#[cfg_attr(
-    not(feature = "object_store"),
-    doc = "See `AvroObjectWriter` (enable the `object_store` feature) for a ready-made implementation."
-)]
+/// For custom sinks, such as remote storage via the [`object_store`] crate, implement this
+/// trait directly, typically by pairing a store handle with an object path and delegating
+/// [`Self::write`] / [`Self::complete`] / [`Self::abort`] to a multipart upload (e.g.
+/// [`object_store::buffered::BufWriter`]).
+///
+/// [`object_store`]: https://crates.io/crates/object_store
+///
+/// # Example: implementing `AsyncFileWriter` for the `object_store` crate
+///
+/// ```no_run
+/// # use std::sync::Arc;
+/// use arrow_avro::writer::AsyncFileWriter;
+/// use arrow_schema::ArrowError;
+/// use bytes::Bytes;
+/// use futures::FutureExt;
+/// use futures::future::BoxFuture;
+/// use object_store::ObjectStore;
+/// use object_store::buffered::BufWriter;
+/// use object_store::path::Path;
+/// use tokio::io::AsyncWriteExt;
+///
+/// #[derive(Debug)]
+/// struct ObjectStoreWriter {
+///     w: BufWriter,
+/// }
+///
+/// impl ObjectStoreWriter {
+///     fn new(store: Arc<dyn ObjectStore>, path: Path) -> Self {
+///         Self { w: BufWriter::new(store, path) }
+///     }
+/// }
+///
+/// impl AsyncFileWriter for ObjectStoreWriter {
+///     fn write(&mut self, bs: Bytes) -> BoxFuture<'_, Result<(), ArrowError>> {
+///         async move {
+///             self.w.put(bs).await.map_err(|e| {
+///                 ArrowError::ExternalError(Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
+///             })
+///         }
+///         .boxed()
+///     }
+///
+///     fn complete(&mut self) -> BoxFuture<'_, Result<(), ArrowError>> {
+///         async move {
+///             self.w.shutdown().await.map_err(|e| {
+///                 ArrowError::IoError(format!("Error finishing object store upload: {e}"), e)
+///             })
+///         }
+///         .boxed()
+///     }
+///
+///     fn abort(&mut self) -> BoxFuture<'_, Result<(), ArrowError>> {
+///         async move {
+///             self.w.abort().await.map_err(|e| {
+///                 ArrowError::ExternalError(Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
+///             })
+///         }
+///         .boxed()
+///     }
+/// }
+/// ```
 pub trait AsyncFileWriter: Send {
     /// Write the provided bytes to the underlying writer.
     ///
@@ -123,10 +170,11 @@ pub trait AsyncFileWriter: Send {
 
     /// Abandon any in-flight writes and clean up partially uploaded state.
     ///
-    /// Implementations backed by multipart uploads (e.g. `AvroObjectWriter`)
-    /// should send the upstream abort here so partial uploads are not billed
-    /// or left lingering. Implementations backed by local sinks (files, in-memory
-    /// buffers) typically have nothing to undo and may leave the default no-op.
+    /// Implementations backed by multipart uploads (e.g. an `object_store`-based
+    /// sink, see the example on the trait documentation) should send the upstream
+    /// abort here so partial uploads are not billed or left lingering.
+    /// Implementations backed by local sinks (files, in-memory buffers) typically
+    /// have nothing to undo and may leave the default no-op.
     ///
     /// `abort` and [`complete`](Self::complete) are mutually exclusive: callers
     /// should invoke at most one of them on a given writer.
@@ -828,3 +876,157 @@ mod tests {
         Ok(())
     }
 }
+
+/// Exercises [`AsyncFileWriter`] against a hand-rolled `object_store`-backed sink
+/// (mirroring the example on the trait documentation), instead of shipping a
+/// dedicated `object_store` integration type in the crate itself.
+#[cfg(test)]
+mod object_store_tests {
+    use super::*;
+    use crate::reader::ReaderBuilder;
+    use crate::writer::format::AvroOcfFormat;
+    use crate::writer::{AsyncAvroWriter, WriterBuilder};
+    use arrow_array::{ArrayRef, Int64Array, RecordBatch};
+    use arrow_schema::{DataType, Field, Schema};
+    use object_store::ObjectStore;
+    use object_store::ObjectStoreExt;
+    use object_store::buffered::BufWriter;
+    use object_store::memory::InMemory;
+    use object_store::path::Path;
+    use std::io::Cursor;
+    use tokio::io::AsyncWriteExt;
+
+    /// An [`AsyncFileWriter`] for a location in an [`ObjectStore`], writing via
+    /// multipart upload. This mirrors the example on the [`AsyncFileWriter`]
+    /// trait documentation.
+    #[derive(Debug)]
+    struct ObjectStoreWriter {
+        w: BufWriter,
+    }
+
+    impl ObjectStoreWriter {
+        fn new(store: Arc<dyn ObjectStore>, path: Path) -> Self {
+            Self {
+                w: BufWriter::new(store, path),
+            }
+        }
+    }
+
+    impl AsyncFileWriter for ObjectStoreWriter {
+        fn write(&mut self, bs: Bytes) -> BoxFuture<'_, Result<(), ArrowError>> {
+            Box::pin(async move {
+                self.w.put(bs).await.map_err(|e| {
+                    ArrowError::ExternalError(
+                        Box::new(e) as Box<dyn std::error::Error + Send + Sync>
+                    )
+                })
+            })
+        }
+
+        fn complete(&mut self) -> BoxFuture<'_, Result<(), ArrowError>> {
+            Box::pin(async move {
+                self.w.shutdown().await.map_err(|e| {
+                    ArrowError::IoError(format!("Error finishing object store upload: {e}"), e)
+                })
+            })
+        }
+
+        fn abort(&mut self) -> BoxFuture<'_, Result<(), ArrowError>> {
+            Box::pin(async move {
+                self.w.abort().await.map_err(|e| {
+                    ArrowError::ExternalError(
+                        Box::new(e) as Box<dyn std::error::Error + Send + Sync>
+                    )
+                })
+            })
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn roundtrip_via_object_store() -> Result<(), Box<dyn std::error::Error>> {
+        let store = Arc::new(InMemory::new()) as Arc<dyn ObjectStore>;
+        let path = Path::from("roundtrip.avro");
+
+        let schema = Schema::new(vec![Field::new("id", DataType::Int64, false)]);
+        let batch = RecordBatch::try_new(
+            Arc::new(schema.clone()),
+            vec![Arc::new(Int64Array::from(vec![10, 20, 30])) as ArrayRef],
+        )?;
+
+        let sink = ObjectStoreWriter::new(Arc::clone(&store), path.clone());
+        let mut writer = AsyncAvroWriter::new(sink, schema).await?;
+        writer.write(&batch).await?;
+        writer.finish().await?;
+
+        let bytes = store.get(&path).await?.bytes().await?;
+        let mut reader = ReaderBuilder::new().build(Cursor::new(bytes))?;
+        let out = reader.next().unwrap()?;
+        assert_eq!(out, batch);
+        Ok(())
+    }
+
+    /// Calling `abort()` before `complete()` must not leave the object behind:
+    /// for the in-memory store, the path simply never appears.
+    #[tokio::test(flavor = "current_thread")]
+    async fn abort_before_complete_leaves_no_object() -> Result<(), Box<dyn std::error::Error>> {
+        let store = Arc::new(InMemory::new()) as Arc<dyn ObjectStore>;
+        let path = Path::from("aborted.avro");
+
+        let schema = Schema::new(vec![Field::new("id", DataType::Int64, false)]);
+        let batch = RecordBatch::try_new(
+            Arc::new(schema.clone()),
+            vec![Arc::new(Int64Array::from(vec![1])) as ArrayRef],
+        )?;
+
+        let sink = ObjectStoreWriter::new(Arc::clone(&store), path.clone());
+        let mut writer = AsyncAvroWriter::new(sink, schema).await?;
+        writer.write(&batch).await?;
+        writer.abort().await?;
+
+        // No GET should succeed for the path we aborted.
+        let err = store.get(&path).await.err();
+        assert!(err.is_some(), "object should not exist after abort()");
+        Ok(())
+    }
+
+    /// Multiple batches accumulated into one OCF block must still round-trip
+    /// when the sink is an object store (validates that block accumulation
+    /// works correctly with the staged-multipart-upload code path).
+    #[tokio::test(flavor = "current_thread")]
+    async fn roundtrip_object_store_with_block_accumulation()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let store = Arc::new(InMemory::new()) as Arc<dyn ObjectStore>;
+        let path = Path::from("multi-batch.avro");
+
+        let schema = Schema::new(vec![Field::new("id", DataType::Int64, false)]);
+        let batches: Vec<RecordBatch> = (0..16)
+            .map(|i| {
+                RecordBatch::try_new(
+                    Arc::new(schema.clone()),
+                    vec![Arc::new(Int64Array::from(vec![i, i + 1, i + 2])) as ArrayRef],
+                )
+                .unwrap()
+            })
+            .collect();
+
+        let sink = ObjectStoreWriter::new(Arc::clone(&store), path.clone());
+        let mut writer = WriterBuilder::new(schema)
+            .build_async::<_, AvroOcfFormat>(sink)
+            .await?;
+        for b in &batches {
+            writer.write(b).await?;
+        }
+        writer.finish().await?;
+
+        let bytes = store.get(&path).await?.bytes().await?;
+        let reader = ReaderBuilder::new().build(Cursor::new(bytes))?;
+        let total: usize = reader
+            .collect::<Result<Vec<_>, _>>()?
+            .iter()
+            .map(|b| b.num_rows())
+            .sum();
+        assert_eq!(total, 16 * 3);
+        Ok(())
+    }
+}
+
