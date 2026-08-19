@@ -802,8 +802,7 @@ mod tests {
     /// (and another on `abort`), and by confirming bytes from the in-progress
     /// block are never observed downstream.
     #[tokio::test(flavor = "current_thread")]
-    async fn test_async_writer_abort_calls_sink_abort()
-    -> Result<(), Box<dyn std::error::Error>> {
+    async fn test_async_writer_abort_calls_sink_abort() -> Result<(), Box<dyn std::error::Error>> {
         // Tracking sink: records `complete` and `abort` invocations and the
         // total bytes received. `Send` is required by `AsyncFileWriter`, so
         // wrap the trackers in `Arc<Mutex<_>>`.
@@ -1029,4 +1028,3 @@ mod object_store_tests {
         Ok(())
     }
 }
-
