@@ -281,6 +281,7 @@ pub struct Format {
     comment: Option<u8>,
     null_regex: NullRegex,
     truncated_rows: bool,
+    ignore_extra_columns: bool,
 }
 
 impl Format {
@@ -346,8 +347,34 @@ impl Format {
     /// When set to true then it will allow records with less than the expected number of columns
     /// and fill the missing columns with nulls. If the record's schema is not nullable, then it
     /// will still return an error.
+    ///
+    /// Rows with *more* than the expected number of columns are unaffected by this setting,
+    /// see [`Self::with_ignore_extra_columns`]. In particular [`Self::infer_schema`] still
+    /// errors on rows with more fields than the first row unless that setting is also enabled.
     pub fn with_truncated_rows(mut self, allow: bool) -> Self {
         self.truncated_rows = allow;
+        self
+    }
+
+    /// Whether to accept records with more than the expected number of columns.
+    ///
+    /// By default this is set to `false` and [`Self::infer_schema`] will error if a record
+    /// has more fields than the header. When set to `true`, such records are accepted and
+    /// their extra trailing fields are ignored for the purposes of type inference.
+    ///
+    /// Note the number of inferred columns is determined by the *first* row alone: the
+    /// header row when [`Self::with_header`] is `true`, otherwise the first record. Extra
+    /// fields in that first row therefore widen the inferred schema rather than being
+    /// ignored, and only subsequent, longer rows are truncated.
+    ///
+    /// This composes with [`Self::with_truncated_rows`]: enabling both accepts rows of any
+    /// length, with short rows contributing no values for the missing columns and long rows
+    /// having their trailing fields ignored.
+    ///
+    /// See [`ReaderBuilder::with_ignore_extra_columns`] for the equivalent setting when
+    /// decoding into a [`RecordBatch`].
+    pub fn with_ignore_extra_columns(mut self, allow: bool) -> Self {
+        self.ignore_extra_columns = allow;
         self
     }
 
@@ -388,6 +415,23 @@ impl Format {
             if !csv_reader.read_record(&mut record).map_err(map_csv_error)? {
                 break;
             }
+
+            let record_length = record.len();
+            let invalid_length = (record_length < header_length && !self.truncated_rows)
+                || (record_length > header_length && !self.ignore_extra_columns);
+            if invalid_length {
+                return Err(ArrowError::CsvError(format!(
+                    "Encountered unequal lengths between records on CSV file. Expected {} \
+                     fields, found {} fields{}",
+                    header_length,
+                    record_length,
+                    record
+                        .position()
+                        .map(|pos| format!(" at line {}", pos.line()))
+                        .unwrap_or_default(),
+                )));
+            }
+
             records_count += 1;
 
             // Note since we may be looking at a sample of the data, we make the safe assumption that
@@ -415,7 +459,7 @@ impl Format {
     fn build_reader<R: Read>(&self, reader: R) -> csv::Reader<R> {
         let mut builder = csv::ReaderBuilder::new();
         builder.has_headers(self.header);
-        builder.flexible(self.truncated_rows);
+        builder.flexible(self.truncated_rows || self.ignore_extra_columns);
 
         if let Some(c) = self.delimiter {
             builder.delimiter(c);
@@ -559,6 +603,44 @@ impl<R> BufReader<R> {
     pub fn truncated_row_count(&self) -> usize {
         self.decoder.truncated_row_count()
     }
+
+    /// The number of rows that had trailing fields discarded because they had more
+    /// fields than the schema
+    ///
+    /// Always 0 unless [`ReaderBuilder::with_ignore_extra_columns`] was set to `true`.
+    ///
+    /// The count is cumulative over the lifetime of this reader, so reading it
+    /// between batches yields a running total of the rows read so far, and reading it
+    /// once the reader is exhausted yields the total for the whole input. Rows that
+    /// are skipped rather than read into a batch, such as a header row or rows before
+    /// the start bound, do not contribute.
+    ///
+    /// Discarded fields leave no trace in the resulting batch, so this counter is the
+    /// only way to tell that data was dropped.
+    ///
+    /// ```
+    /// # use std::io::Cursor;
+    /// # use std::sync::Arc;
+    /// # use arrow_csv::ReaderBuilder;
+    /// # use arrow_schema::{DataType, Field, Schema};
+    /// #
+    /// let schema = Arc::new(Schema::new(vec![
+    ///     Field::new("a", DataType::Int32, true),
+    ///     Field::new("b", DataType::Int32, true),
+    /// ]));
+    ///
+    /// let mut reader = ReaderBuilder::new(schema)
+    ///     .with_ignore_extra_columns(true)
+    ///     .build(Cursor::new("1,2\n3,4,5\n"))
+    ///     .unwrap();
+    ///
+    /// let batches = reader.by_ref().collect::<Result<Vec<_>, _>>().unwrap();
+    /// assert_eq!(batches[0].num_rows(), 2);
+    /// assert_eq!(reader.extra_column_row_count(), 1);
+    /// ```
+    pub fn extra_column_row_count(&self) -> usize {
+        self.decoder.extra_column_row_count()
+    }
 }
 
 impl<R: Read> Reader<R> {
@@ -693,6 +775,14 @@ impl Decoder {
 
                 let rows = self.record_decoder.flush()?;
                 validate_header(&rows, self.schema.fields())?;
+
+                // The header is skipped rather than decoded into a batch, so it must not
+                // contribute to the row counters. Unlike the branch below it is flushed
+                // rather than cleared, as `validate_header` needs the decoded names, so
+                // discard the counts it contributed here. `flush` has already emptied the
+                // buffers, making this `clear` a no-op for everything else
+                self.record_decoder.clear();
+
                 self.header_validation = false;
                 self.to_skip -= 1;
                 return Ok(bytes);
@@ -754,6 +844,23 @@ impl Decoder {
     /// two apart.
     pub fn truncated_row_count(&self) -> usize {
         self.record_decoder.truncated_row_count()
+    }
+
+    /// The number of rows that had trailing fields discarded because they had more
+    /// fields than the schema
+    ///
+    /// Always 0 unless [`ReaderBuilder::with_ignore_extra_columns`] was set to `true`.
+    ///
+    /// The count is cumulative over the lifetime of this decoder and is not reset by
+    /// [`Self::flush`], so reading it between batches yields a running total of the
+    /// rows decoded so far, and reading it once the input is exhausted yields the
+    /// total for the whole stream. Rows that are skipped rather than decoded into a
+    /// batch, such as a header row or rows before the start bound, do not contribute.
+    ///
+    /// Discarded fields leave no trace in the decoded batch, so this counter is the only
+    /// way to tell that data was dropped.
+    pub fn extra_column_row_count(&self) -> usize {
+        self.record_decoder.extra_column_row_count()
     }
 }
 
@@ -1321,8 +1428,36 @@ impl ReaderBuilder {
     /// When set to true then it will allow records with less than the expected number of columns
     /// and fill the missing columns with nulls. If the record's schema is not nullable, then it
     /// will still return an error.
+    ///
+    /// Rows with *more* than the expected number of columns are unaffected by this setting,
+    /// see [`Self::with_ignore_extra_columns`].
     pub fn with_truncated_rows(mut self, allow: bool) -> Self {
         self.format.truncated_rows = allow;
+        self
+    }
+
+    /// Set whether records with more than the expected number of columns are accepted.
+    ///
+    /// By default this is set to `false` and a record with more fields than the schema has
+    /// columns is an error. When set to `true`, the leading fields are decoded as usual and
+    /// the extra trailing fields are discarded.
+    ///
+    /// If header validation is enabled via [`Self::with_header_validation`], extra trailing
+    /// header names are likewise discarded and only the names corresponding to schema fields
+    /// are validated.
+    ///
+    /// This composes with [`Self::with_truncated_rows`]: enabling both accepts rows of any
+    /// length, with short rows padded with nulls and long rows truncated. The two cases are
+    /// counted separately, by [`BufReader::truncated_row_count`] and
+    /// [`BufReader::extra_column_row_count`] respectively.
+    ///
+    /// # Discarded fields are not validated
+    ///
+    /// Discarded fields are dropped before the record is decoded, so their contents are
+    /// never inspected. In particular a row is accepted even when its extra trailing fields
+    /// contain invalid UTF-8, which would otherwise be an error.
+    pub fn with_ignore_extra_columns(mut self, allow: bool) -> Self {
+        self.format.ignore_extra_columns = allow;
         self
     }
 
@@ -1355,6 +1490,7 @@ impl ReaderBuilder {
             delimiter,
             self.schema.fields().len(),
             self.format.truncated_rows,
+            self.format.ignore_extra_columns,
         );
 
         let header = self.format.header as usize;
@@ -2615,6 +2751,30 @@ mod tests {
     }
 
     #[test]
+    fn test_header_validation_with_extra_columns() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Int32, false),
+            Field::new("b", DataType::Int32, false),
+        ]));
+        let csv = "a,b,ignored,also_ignored\n1,2,3,4\n";
+
+        let batch = ReaderBuilder::new(schema)
+            .with_header(true)
+            .with_header_validation(true)
+            .with_ignore_extra_columns(true)
+            .build_buffered(Cursor::new(csv.as_bytes()))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(batch.num_rows(), 1);
+        assert_eq!(batch.num_columns(), 2);
+        assert_eq!(batch.column(0).as_primitive::<Int32Type>().value(0), 1);
+        assert_eq!(batch.column(1).as_primitive::<Int32Type>().value(0), 2);
+    }
+
+    #[test]
     fn test_null_boolean() {
         let csv = "true,false\nFalse,True\n,True\nFalse,";
         let schema = Arc::new(Schema::new(vec![
@@ -2679,6 +2839,210 @@ mod tests {
             Err(ArrowError::CsvError(e)) => e.contains("incorrect number of fields"),
             _ => false,
         });
+    }
+
+    #[test]
+    fn test_ignore_extra_columns() {
+        let data = "a,b\nkept,\"quoted,kept\",ignored\nnext,value,x,y,z\n";
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Utf8, false),
+            Field::new("b", DataType::Utf8, false),
+        ]));
+
+        let batch = ReaderBuilder::new(schema)
+            .with_header(true)
+            .with_ignore_extra_columns(true)
+            .build(Cursor::new(data))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(batch.num_rows(), 2);
+        let a = batch.column(0).as_string::<i32>();
+        let b = batch.column(1).as_string::<i32>();
+        assert_eq!(a.value(0), "kept");
+        assert_eq!(b.value(0), "quoted,kept");
+        assert_eq!(a.value(1), "next");
+        assert_eq!(b.value(1), "value");
+    }
+
+    #[test]
+    fn test_ignore_extra_columns_push_decoder_byte_by_byte() {
+        let data = b"a,b,ignored,\"also,ignored\",x,y\nc,d,x\n";
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Utf8, false),
+            Field::new("b", DataType::Utf8, false),
+        ]));
+        let mut decoder = ReaderBuilder::new(schema)
+            .with_ignore_extra_columns(true)
+            .with_batch_size(2)
+            .build_decoder();
+
+        for byte in data {
+            assert_eq!(decoder.decode(std::slice::from_ref(byte)).unwrap(), 1);
+        }
+        assert_eq!(decoder.decode(&[]).unwrap(), 0);
+
+        let batch = decoder.flush().unwrap().unwrap();
+        assert_eq!(batch.num_rows(), 2);
+        let a = batch.column(0).as_string::<i32>();
+        let b = batch.column(1).as_string::<i32>();
+        assert_eq!(a.value(0), "a");
+        assert_eq!(b.value(0), "b");
+        assert_eq!(a.value(1), "c");
+        assert_eq!(b.value(1), "d");
+    }
+
+    #[test]
+    fn test_ignore_extra_columns_with_truncated_rows() {
+        let data = "1\n2,3,ignored\n4,5\n";
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Int32, true),
+            Field::new("b", DataType::Int32, true),
+        ]));
+
+        let mut reader = ReaderBuilder::new(schema)
+            .with_truncated_rows(true)
+            .with_ignore_extra_columns(true)
+            .build(Cursor::new(data))
+            .unwrap();
+        let batches = reader.by_ref().collect::<Result<Vec<_>, _>>().unwrap();
+
+        assert_eq!(batches[0].num_rows(), 3);
+        // The short and the long row are counted separately
+        assert_eq!(reader.truncated_row_count(), 1);
+        assert_eq!(reader.extra_column_row_count(), 1);
+        let b = batches[0].column(1).as_primitive::<Int32Type>();
+        assert!(b.is_null(0));
+        assert_eq!(b.value(1), 3);
+        assert_eq!(b.value(2), 5);
+    }
+
+    /// Rows that are not decoded into a batch must not contribute to the counter,
+    /// including an oversized header row, which unlike a short one is accepted by
+    /// header validation
+    #[test]
+    fn test_extra_column_row_count_ignores_skipped_rows() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Utf8, true),
+            Field::new("b", DataType::Utf8, true),
+        ]));
+
+        // The header is the only skipped row, so nothing else resets the counter
+        let data = "a,b,extra\n1,2,extra\n3,4\n";
+        for validate in [false, true] {
+            let mut reader = ReaderBuilder::new(schema.clone())
+                .with_header(true)
+                .with_header_validation(validate)
+                .with_ignore_extra_columns(true)
+                .build(Cursor::new(data))
+                .unwrap();
+
+            let batches = reader.by_ref().collect::<Result<Vec<_>, _>>().unwrap();
+            assert_eq!(batches[0].num_rows(), 2);
+            assert_eq!(
+                reader.extra_column_row_count(),
+                1,
+                "header only, validate_header = {validate}"
+            );
+        }
+
+        // Rows before the start bound are skipped too
+        let data = "a,b,extra\nskipped,row,extra\n1,2,extra\n3,4\n";
+        for validate in [false, true] {
+            let mut reader = ReaderBuilder::new(schema.clone())
+                .with_header(true)
+                .with_header_validation(validate)
+                .with_ignore_extra_columns(true)
+                .with_bounds(1, 3)
+                .build(Cursor::new(data))
+                .unwrap();
+
+            let batches = reader.by_ref().collect::<Result<Vec<_>, _>>().unwrap();
+            assert_eq!(batches[0].num_rows(), 2);
+            assert_eq!(
+                reader.extra_column_row_count(),
+                1,
+                "with bounds, validate_header = {validate}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_extra_column_row_count_zero_when_disabled() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Utf8, true),
+            Field::new("b", DataType::Utf8, true),
+        ]));
+        let mut reader = ReaderBuilder::new(schema)
+            .build(Cursor::new("1,2\n3,4\n"))
+            .unwrap();
+        let batches = reader.by_ref().collect::<Result<Vec<_>, _>>().unwrap();
+        assert_eq!(batches[0].num_rows(), 2);
+        assert_eq!(reader.extra_column_row_count(), 0);
+    }
+
+    #[test]
+    fn test_infer_schema_with_extra_columns() {
+        let data = "a,b\n1,true,ignored\n2,false,x,y\n";
+        let (schema, records) = Format::default()
+            .with_header(true)
+            .with_ignore_extra_columns(true)
+            .infer_schema(Cursor::new(data), None)
+            .unwrap();
+
+        assert_eq!(records, 2);
+        assert_eq!(schema.fields().len(), 2);
+        assert_eq!(schema.field(0).name(), "a");
+        assert_eq!(schema.field(0).data_type(), &DataType::Int64);
+        assert_eq!(schema.field(1).name(), "b");
+        assert_eq!(schema.field(1).data_type(), &DataType::Boolean);
+    }
+
+    #[test]
+    fn test_infer_schema_ignore_extra_columns_rejects_truncated_rows() {
+        let data = "a,b\n1\n";
+        let err = Format::default()
+            .with_header(true)
+            .with_ignore_extra_columns(true)
+            .infer_schema(Cursor::new(data), None)
+            .unwrap_err();
+
+        assert_eq!(
+            err.to_string(),
+            "Csv error: Encountered unequal lengths between records on CSV file. Expected 2 fields, found 1 fields at line 2"
+        );
+    }
+
+    #[test]
+    fn test_infer_schema_truncated_rows_rejects_extra_columns() {
+        let data = "a,b\n1,true,ignored\n";
+        let err = Format::default()
+            .with_header(true)
+            .with_truncated_rows(true)
+            .infer_schema(Cursor::new(data), None)
+            .unwrap_err();
+
+        assert_eq!(
+            err.to_string(),
+            "Csv error: Encountered unequal lengths between records on CSV file. Expected 2 fields, found 3 fields at line 2"
+        );
+    }
+
+    #[test]
+    fn test_infer_schema_accepts_short_and_long_rows_when_enabled() {
+        let data = "a,b\n1\n2,true,ignored\n";
+        let (schema, records) = Format::default()
+            .with_header(true)
+            .with_truncated_rows(true)
+            .with_ignore_extra_columns(true)
+            .infer_schema(Cursor::new(data), None)
+            .unwrap();
+
+        assert_eq!(records, 2);
+        assert_eq!(schema.field(0).data_type(), &DataType::Int64);
+        assert_eq!(schema.field(1).data_type(), &DataType::Boolean);
     }
 
     #[test]
@@ -3156,7 +3520,7 @@ mod tests {
         // Include line number in the error message to help locate and fix the issue
         assert_eq!(
             result.err().unwrap().to_string(),
-            "Csv error: Encountered unequal lengths between records on CSV file. Expected 3 records, found 2 records at line 3"
+            "Csv error: Encountered unequal lengths between records on CSV file. Expected 3 fields, found 2 fields at line 3"
         );
     }
 
