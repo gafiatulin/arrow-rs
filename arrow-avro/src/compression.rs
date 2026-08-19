@@ -70,7 +70,7 @@ impl Default for DeflateLevel {
 impl DeflateLevel {
     /// Try to construct a [`DeflateLevel`] from a raw `u32` in `0..=9`.
     pub fn try_new(level: u32) -> Result<Self, ArrowError> {
-        Self::is_valid_level(level).map(|_| Self(level))
+        Self::is_valid_level(level).map(|()| Self(level))
     }
 
     /// Returns the raw level value.
@@ -100,7 +100,7 @@ impl Default for ZstdLevel {
 impl ZstdLevel {
     /// Try to construct a [`ZstdLevel`] from a raw `i32` in `1..=22`.
     pub fn try_new(level: i32) -> Result<Self, ArrowError> {
-        Self::is_valid_level(level).map(|_| Self(level))
+        Self::is_valid_level(level).map(|()| Self(level))
     }
 
     /// Returns the raw level value.
@@ -132,7 +132,7 @@ impl Default for Bzip2Level {
 impl Bzip2Level {
     /// Try to construct a [`Bzip2Level`] from a raw `u32` in `1..=9`.
     pub fn try_new(level: u32) -> Result<Self, ArrowError> {
-        Self::is_valid_level(level).map(|_| Self(level))
+        Self::is_valid_level(level).map(|()| Self(level))
     }
 
     /// Returns the raw level value.
@@ -161,7 +161,7 @@ impl Default for XzLevel {
 impl XzLevel {
     /// Try to construct an [`XzLevel`] from a raw `u32` in `0..=9`.
     pub fn try_new(level: u32) -> Result<Self, ArrowError> {
-        Self::is_valid_level(level).map(|_| Self(level))
+        Self::is_valid_level(level).map(|()| Self(level))
     }
 
     /// Returns the raw level value.
