@@ -165,7 +165,7 @@ use crate::errors::AvroError;
 use crate::schema::{
     AvroSchema, Fingerprint, FingerprintAlgorithm, FingerprintStrategy, SCHEMA_METADATA_KEY,
 };
-use crate::writer::encoder::{RecordEncoder, RecordEncoderBuilder, write_long};
+use crate::writer::encoder::{RecordEncoder, RecordEncoderBuilder, encode_long};
 use crate::writer::format::{AvroFormat, AvroOcfFormat, AvroSoeFormat};
 use arrow_array::RecordBatch;
 use arrow_schema::{Schema, SchemaRef};
@@ -1217,11 +1217,14 @@ impl<W: Write, F: AvroFormat> Writer<W, F> {
             None => None,
         };
         let block: &[u8] = compressed.as_deref().unwrap_or_else(|| self.block.bytes());
-        let mut header = Vec::with_capacity(20);
-        write_long(&mut header, self.block.rows() as i64)?;
-        write_long(&mut header, block.len() as i64)?;
+        // The header is at most two varints, so frame it on the stack: a block can be 64 KiB and
+        // a twenty-byte allocation per block is the one thing left to avoid here.
+        let mut header = [0u8; 20];
+        let mut header_len = encode_long(&mut header, self.block.rows() as i64);
+        header_len += encode_long(&mut header[header_len..], block.len() as i64);
+        let header = &header[..header_len];
         let write_block = |writer: &mut W, block: &[u8]| {
-            writer.write_all(&header)?;
+            writer.write_all(header)?;
             writer.write_all(block)?;
             writer.write_all(sync)
         };

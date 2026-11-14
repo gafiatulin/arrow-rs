@@ -53,14 +53,17 @@ macro_rules! for_rows_with_prefix {
     }};
 }
 
-/// Encode a single Avro-`long` using ZigZag + variable length, buffered.
+/// Encode a single Avro-`long` using ZigZag + variable length into `buf`.
+///
+/// Returns the number of bytes written, which is at most ten; `buf` must have room for that
+/// many. Callers that already own a buffer use this to frame a block without allocating; the
+/// `Write`-based [`write_long`] is the same encoder plus the write.
 ///
 /// Spec: <https://avro.apache.org/docs/1.11.1/specification/#binary-encoding>
 #[inline]
-pub(crate) fn write_long<W: Write + ?Sized>(out: &mut W, value: i64) -> Result<(), AvroError> {
+pub(crate) fn encode_long(buf: &mut [u8], value: i64) -> usize {
+    debug_assert!(buf.len() >= 10, "a varint long needs at most 10 bytes");
     let mut zz = ((value << 1) ^ (value >> 63)) as u64;
-    // At most 10 bytes for 64-bit varint
-    let mut buf = [0u8; 10];
     let mut i = 0;
     while (zz & !0x7F) != 0 {
         buf[i] = ((zz & 0x7F) as u8) | 0x80;
@@ -68,8 +71,17 @@ pub(crate) fn write_long<W: Write + ?Sized>(out: &mut W, value: i64) -> Result<(
         zz >>= 7;
     }
     buf[i] = (zz & 0x7F) as u8;
-    i += 1;
-    out.write_all(&buf[..i])
+    i + 1
+}
+
+/// Encode a single Avro-`long` using ZigZag + variable length.
+///
+/// Spec: <https://avro.apache.org/docs/1.11.1/specification/#binary-encoding>
+#[inline]
+pub(crate) fn write_long<W: Write + ?Sized>(out: &mut W, value: i64) -> Result<(), AvroError> {
+    let mut buf = [0u8; 10];
+    let len = encode_long(&mut buf, value);
+    out.write_all(&buf[..len])
         .map_err(|e| AvroError::IoError(format!("write long: {e}"), e))
 }
 

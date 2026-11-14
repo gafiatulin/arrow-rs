@@ -50,7 +50,7 @@
 
 use crate::compression::LeveledCodec;
 use crate::errors::AvroError;
-use crate::writer::encoder::{RecordEncoder, write_long};
+use crate::writer::encoder::{RecordEncoder, encode_long};
 use crate::writer::format::{AvroFormat, AvroOcfFormat, AvroSoeFormat};
 use crate::writer::{BlockBuf, WriteStats, WriterBuilder, sink_failed_error};
 use arrow_array::RecordBatch;
@@ -528,21 +528,26 @@ impl<W: AsyncFileWriter, F: AvroFormat> AsyncWriter<W, F> {
             .unwrap_or_else(|| self.block.bytes())
             .len();
 
-        let mut header_buf = Vec::<u8>::with_capacity(16);
-        write_long(&mut header_buf, self.block.rows() as i64)?;
-        write_long(&mut header_buf, payload_len as i64)?;
-        self.sink_write(Bytes::from(header_buf)).await?;
+        // The header is at most two varints; framing it on the stack keeps the per-block cost to
+        // the payload copy below rather than an allocation of its own.
+        let mut header = [0u8; 20];
+        let mut header_len = encode_long(&mut header, self.block.rows() as i64);
+        header_len += encode_long(&mut header[header_len..], payload_len as i64);
+        let header = &header[..header_len];
 
-        // An uncompressed payload is already a copy of the staging buffer, so the trailing sync
-        // marker rides along in the same write. A compressed payload is not copied again just to
-        // append 16 bytes, so its marker goes out on its own.
+        // An uncompressed payload is already a copy of the staging buffer, so the header and the
+        // trailing sync marker ride along in a single write. A compressed payload is not copied
+        // again just to save two writes, so it keeps one write per part.
         match compressed {
             Some(compressed) => {
+                self.sink_write(Bytes::copy_from_slice(header)).await?;
                 self.sink_write(Bytes::from(compressed)).await?;
                 self.sink_write(Bytes::copy_from_slice(sync)).await?;
             }
             None => {
-                let mut block = Vec::with_capacity(self.block.bytes().len() + sync.len());
+                let mut block =
+                    Vec::with_capacity(header.len() + self.block.bytes().len() + sync.len());
+                block.extend_from_slice(header);
                 block.extend_from_slice(self.block.bytes());
                 block.extend_from_slice(sync);
                 self.sink_write(Bytes::from(block)).await?;
@@ -1338,10 +1343,15 @@ mod tests {
         Ok(())
     }
 
-    /// An uncompressed block goes out as two sink writes — header, then payload carrying the
-    /// sync marker — while a compressed payload keeps its own write instead of being copied.
+    /// An uncompressed block goes out as one sink write, because its payload is copied for the
+    /// sync marker anyway; a compressed payload keeps one write per part instead of being copied
+    /// just to save two writes.
+    ///
+    /// The expected counts are what the writer does, not what the format requires: the two
+    /// layouts produce the same bytes. This is deliberately an implementation pin, so a change
+    /// that makes a block reach the sink in more pieces has to come with a reason.
     #[tokio::test(flavor = "current_thread")]
-    async fn test_writes_per_block() -> Result<(), Box<dyn std::error::Error>> {
+    async fn test_uncompressed_block_is_one_sink_write() -> Result<(), Box<dyn std::error::Error>> {
         async fn writes_per_block(
             compression: Option<crate::compression::CompressionCodec>,
         ) -> Result<usize, Box<dyn std::error::Error>> {
@@ -1364,8 +1374,8 @@ mod tests {
 
         assert_eq!(
             writes_per_block(None).await?,
-            2,
-            "header, then payload with sync"
+            1,
+            "header, payload and sync marker share one write"
         );
         #[cfg(feature = "deflate")]
         assert_eq!(
