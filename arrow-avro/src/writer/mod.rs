@@ -131,7 +131,9 @@
 //!
 //! ---
 use crate::codec::AvroFieldBuilder;
-use crate::compression::CompressionCodec;
+use crate::compression::{
+    Bzip2Level, CompressionCodec, DeflateLevel, LeveledCodec, XzLevel, ZstdLevel,
+};
 use crate::errors::AvroError;
 use crate::schema::{
     AvroSchema, Fingerprint, FingerprintAlgorithm, FingerprintStrategy, SCHEMA_METADATA_KEY,
@@ -305,6 +307,10 @@ impl EncodedRows {
 pub struct WriterBuilder {
     schema: Schema,
     codec: Option<CompressionCodec>,
+    deflate_level: Option<DeflateLevel>,
+    zstd_level: Option<ZstdLevel>,
+    bzip2_level: Option<Bzip2Level>,
+    xz_level: Option<XzLevel>,
     row_capacity: Option<usize>,
     capacity: usize,
     fingerprint_strategy: Option<FingerprintStrategy>,
@@ -321,6 +327,10 @@ impl WriterBuilder {
         Self {
             schema,
             codec: None,
+            deflate_level: None,
+            zstd_level: None,
+            bzip2_level: None,
+            xz_level: None,
             row_capacity: None,
             capacity: 1024,
             fingerprint_strategy: None,
@@ -338,6 +348,58 @@ impl WriterBuilder {
     pub fn with_compression(mut self, codec: Option<CompressionCodec>) -> Self {
         self.codec = codec;
         self
+    }
+
+    /// Set the deflate compression level.
+    ///
+    /// Used only when [`CompressionCodec::Deflate`] is the selected codec; the default is
+    /// [`DeflateLevel::default`].
+    pub fn with_deflate_level(mut self, level: DeflateLevel) -> Self {
+        self.deflate_level = Some(level);
+        self
+    }
+
+    /// Set the ZStandard compression level.
+    ///
+    /// Used only when [`CompressionCodec::ZStandard`] is the selected codec; the default is
+    /// [`ZstdLevel::default`].
+    pub fn with_zstd_level(mut self, level: ZstdLevel) -> Self {
+        self.zstd_level = Some(level);
+        self
+    }
+
+    /// Set the bzip2 compression level.
+    ///
+    /// Used only when [`CompressionCodec::Bzip2`] is the selected codec; the default is
+    /// [`Bzip2Level::default`].
+    pub fn with_bzip2_level(mut self, level: Bzip2Level) -> Self {
+        self.bzip2_level = Some(level);
+        self
+    }
+
+    /// Set the xz compression level.
+    ///
+    /// Used only when [`CompressionCodec::Xz`] is the selected codec; the default is
+    /// [`XzLevel::default`].
+    pub fn with_xz_level(mut self, level: XzLevel) -> Self {
+        self.xz_level = Some(level);
+        self
+    }
+
+    /// Resolve the selected codec and its level into the value writers compress with.
+    fn leveled_codec(&self) -> Option<LeveledCodec> {
+        let codec = self.codec?;
+        Some(match codec {
+            CompressionCodec::Deflate => {
+                LeveledCodec::Deflate(self.deflate_level.unwrap_or_default())
+            }
+            CompressionCodec::Snappy => LeveledCodec::Snappy,
+            CompressionCodec::ZStandard => {
+                LeveledCodec::ZStandard(self.zstd_level.unwrap_or_default())
+            }
+            CompressionCodec::Bzip2 => LeveledCodec::Bzip2(self.bzip2_level.unwrap_or_default()),
+            CompressionCodec::Xz => LeveledCodec::Xz(self.xz_level.unwrap_or_default()),
+        })
     }
 
     /// Sets the expected capacity (in bytes) for internal buffers.
@@ -429,7 +491,7 @@ impl WriterBuilder {
             writer,
             schema,
             format,
-            compression: self.codec,
+            compression: self.leveled_codec(),
             capacity: self.capacity,
             encoder,
         })
@@ -552,7 +614,7 @@ pub struct Writer<W: Write, F: AvroFormat> {
     writer: W,
     schema: SchemaRef,
     format: F,
-    compression: Option<CompressionCodec>,
+    compression: Option<LeveledCodec>,
     capacity: usize,
     encoder: RecordEncoder,
 }
