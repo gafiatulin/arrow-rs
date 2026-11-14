@@ -107,7 +107,7 @@ enum ReaderState<R> {
 /// let mut writer = AvroWriter::new(buffer, schema)?;
 /// writer.write(&batch)?;
 /// writer.finish()?;
-/// let bytes = writer.into_inner();
+/// let bytes = writer.into_inner()?;
 ///
 /// // Create an async reader from the in-memory bytes
 /// // `tokio::fs::File` also implements `AsyncFileReader` for reading from disk

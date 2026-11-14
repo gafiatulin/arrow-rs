@@ -89,7 +89,7 @@
 //! let mut writer = AvroWriter::new(buffer, schema.clone())?;
 //! writer.write(&batch)?;
 //! writer.finish()?;
-//! let bytes = writer.into_inner();
+//! let bytes = writer.into_inner()?;
 //!
 //! // Read it back with ReaderBuilder
 //! let mut reader = ReaderBuilder::new().build(Cursor::new(bytes))?;
@@ -183,7 +183,7 @@
 //!     .build::<_, AvroSoeFormat>(Vec::new())?;
 //! w.write(&batch)?;
 //! w.finish()?;
-//! let frame = w.into_inner(); // C3 01 + fp + Avro body
+//! let frame = w.into_inner()?; // C3 01 + fp + Avro body
 //!
 //! // Decode with a `Decoder`
 //! let mut dec = ReaderBuilder::new()
@@ -243,7 +243,7 @@
 //!         .with_fingerprint_strategy(FingerprintStrategy::Id(schema_id)) // 0x00 + ID + body
 //!         .build::<_, AvroSoeFormat>(Vec::new())?;
 //!     w.write(&batch)?; w.finish()?;
-//!     Ok(w.into_inner())
+//!     Ok(w.into_inner()?)
 //! }
 //! let m1 = msg(1, "a", &avro_schema, schema_id)?;
 //! let m2 = msg(2, "b", &avro_schema, schema_id)?;
@@ -309,7 +309,7 @@
 //! let mut w = AvroWriter::new(Vec::<u8>::new(), writer_arrow)?;
 //! w.write(&batch)?;
 //! w.finish()?;
-//! let bytes = w.into_inner();
+//! let bytes = w.into_inner()?;
 //!
 //! // Reader (current version):
 //! //  - record name "topLevelRecord" matches the crate's default for OCF
@@ -397,7 +397,7 @@
 //!         .with_fingerprint_strategy(FingerprintStrategy::Id(id_v0))
 //!         .build::<_, arrow_avro::writer::format::AvroSoeFormat>(Vec::new())?;
 //!     w0.write(&batch0)?; w0.finish()?;
-//!     let frame0 = w0.into_inner(); // 0x00 + id_v0 + body
+//!     let frame0 = w0.into_inner()?; // 0x00 + id_v0 + body
 //!
 //!     // frame1: writer v1 body {id:2002_i64, name:"v1-bob", email: Some("bob@example.com")}
 //!     let mut md1 = HashMap::new();
@@ -415,7 +415,7 @@
 //!         .with_fingerprint_strategy(FingerprintStrategy::Id(id_v1))
 //!         .build::<_, arrow_avro::writer::format::AvroSoeFormat>(Vec::new())?;
 //!     w1.write(&batch1)?; w1.finish()?;
-//!     let frame1 = w1.into_inner(); // 0x00 + id_v1 + body
+//!     let frame1 = w1.into_inner()?; // 0x00 + id_v1 + body
 //!
 //!     // Build a streaming Decoder that understands Confluent framing
 //!     let mut decoder = ReaderBuilder::new()
@@ -587,7 +587,7 @@ pub enum DecoderMode {
 /// # let mut w = WriterBuilder::new(arrow)
 /// #     .with_fingerprint_strategy(fp.into())
 /// #     .build::<_, AvroSoeFormat>(Vec::new())?;
-/// # w.write(&batch)?; w.finish()?; let frame = w.into_inner();
+/// # w.write(&batch)?; w.finish()?; let frame = w.into_inner()?;
 ///
 /// let mut decoder = ReaderBuilder::new()
 ///     .with_writer_schema_store(store)
@@ -630,7 +630,7 @@ pub enum DecoderMode {
 /// #   let mut w = WriterBuilder::new(arrow)
 /// #       .with_fingerprint_strategy(FingerprintStrategy::Id(1234))
 /// #       .build::<_, AvroSoeFormat>(Vec::new())?;
-/// #   w.write(&batch)?; w.finish()?; Ok(w.into_inner())
+/// #   w.write(&batch)?; w.finish()?; Ok(w.into_inner()?)
 /// # }
 /// # let m1 = msg(1)?;
 /// # let m2 = msg(2)?;
@@ -1280,7 +1280,7 @@ impl ReaderBuilder {
     /// let mut writer = AvroWriter::new(Vec::new(), schema)?;
     /// writer.write(&batch)?;
     /// writer.finish()?;
-    /// let bytes = writer.into_inner();
+    /// let bytes = writer.into_inner()?;
     ///
     /// // Read only fields at indices 2 and 0 (value, id) — in that order
     /// let mut reader = ReaderBuilder::new()
@@ -1546,7 +1546,7 @@ mod test {
         let mut writer = AvroWriter::new(Vec::<u8>::new(), schema).unwrap();
         writer.write(&batch).unwrap();
         writer.finish().unwrap();
-        let bytes = writer.into_inner();
+        let bytes = writer.into_inner().unwrap();
 
         let reader = ReaderBuilder::new()
             .with_utf8_view(true)
@@ -1875,7 +1875,7 @@ mod test {
             w.write(b).expect("write");
         }
         w.finish().expect("finish");
-        w.into_inner()
+        w.into_inner().unwrap()
     }
 
     #[test]

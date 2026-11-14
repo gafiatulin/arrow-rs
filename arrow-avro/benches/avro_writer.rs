@@ -7,12 +7,15 @@
 use arrow_array::{
     ArrayRef, BinaryArray, BooleanArray, Decimal128Array, Decimal256Array, FixedSizeBinaryArray,
     Float32Array, Float64Array, ListArray, PrimitiveArray, RecordBatch, StringArray, StructArray,
+    UInt32Array,
     builder::{ListBuilder, StringBuilder},
     types::{Int32Type, Int64Type, IntervalMonthDayNanoType, TimestampMicrosecondType},
 };
 #[cfg(feature = "small_decimals")]
 use arrow_array::{Decimal32Array, Decimal64Array};
-use arrow_avro::writer::AvroWriter;
+use arrow_avro::compression::CompressionCodec;
+use arrow_avro::writer::format::AvroOcfFormat;
+use arrow_avro::writer::{AvroWriter, WriterBuilder};
 use arrow_buffer::{Buffer, i256};
 use arrow_schema::{DataType, Field, IntervalUnit, Schema, TimeUnit, UnionFields, UnionMode};
 use criterion::{BatchSize, BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
@@ -22,6 +25,7 @@ use rand::{
     rngs::StdRng,
 };
 use std::io::Cursor;
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::time::Duration;
 use std::{collections::HashMap, sync::LazyLock};
@@ -754,9 +758,8 @@ fn ocf_size_for_batch(batch: &RecordBatch) -> usize {
     let cursor = Cursor::new(Vec::<u8>::with_capacity(1024));
     let mut writer = AvroWriter::new(cursor, schema_owned).expect("create writer");
     writer.write(batch).expect("write batch");
-    writer.finish().expect("finish writer");
-    let inner = writer.into_inner();
-    inner.into_inner().len()
+    let cursor = writer.into_inner().expect("flush writer");
+    cursor.into_inner().len()
 }
 
 fn bench_writer_scenario(c: &mut Criterion, name: &str, data_sets: &[RecordBatch]) {
@@ -804,7 +807,104 @@ fn bench_writer_scenario(c: &mut Criterion, name: &str, data_sets: &[RecordBatch
     group.finish();
 }
 
+/// One batch of `rows` `UInt32` values, either highly compressible or random.
+fn block_size_batch(rows: usize, compressible: bool) -> RecordBatch {
+    let mut rng = rng_for(0xB10C_C5EE, rows);
+    let values: Vec<u32> = if compressible {
+        (0..rows as u32).map(|v| v % 16).collect()
+    } else {
+        (0..rows).map(|_| rng.random_range(0..=u32::MAX)).collect()
+    };
+    RecordBatch::try_new(
+        Arc::new(Schema::new(vec![Field::new("v", DataType::UInt32, false)])),
+        vec![Arc::new(UInt32Array::from(values)) as ArrayRef],
+    )
+    .expect("failed to build benchmark RecordBatch")
+}
+
+/// OCF block accumulation: how much a block buffers before it is emitted trades per-block framing
+/// and compression against memory and read granularity, so measure the legacy per-batch flush
+/// against the default 64 KiB block and a 1 MiB one, on compressible and random data.
+fn bench_block_size(c: &mut Criterion) {
+    const BATCHES: usize = 32;
+    const ROWS: usize = 1_024;
+    const BLOCK_SIZES: [(&str, Option<NonZeroUsize>); 3] = [
+        ("per-batch", None),
+        ("64KiB", NonZeroUsize::new(64 * 1024)),
+        ("1MiB", NonZeroUsize::new(1024 * 1024)),
+    ];
+
+    // Deflate and zstd are cheap enough to run every block-size and data case; bzip2 and xz
+    // compress an order of magnitude more slowly and are left out to keep the group's runtime
+    // reasonable.
+    let mut codecs: Vec<(&str, Option<CompressionCodec>)> = vec![("plain", None)];
+    #[cfg(feature = "deflate")]
+    codecs.push(("deflate", Some(CompressionCodec::Deflate)));
+    #[cfg(feature = "zstd")]
+    codecs.push(("zstd", Some(CompressionCodec::ZStandard)));
+
+    let mut group = c.benchmark_group("write-ocf-block-size");
+    for (data_label, compressible) in [("compressible", true), ("random", false)] {
+        let batch = block_size_batch(ROWS, compressible);
+        let bytes = batch.get_array_memory_size() as u64 * BATCHES as u64;
+        for (codec_label, codec) in &codecs {
+            for (block_label, block_size) in BLOCK_SIZES {
+                group.throughput(Throughput::Bytes(bytes));
+                group.bench_with_input(
+                    BenchmarkId::new(format!("{data_label}/{codec_label}"), block_label),
+                    &(block_size, *codec),
+                    |b, &(block_size, codec)| {
+                        b.iter_batched(
+                            || {
+                                let builder = WriterBuilder::new(batch.schema().as_ref().clone())
+                                    .with_compression(codec);
+                                let builder = match block_size {
+                                    Some(block_size) => builder.with_block_size(block_size),
+                                    None => builder.without_block_buffering(),
+                                };
+                                builder
+                                    .build::<_, AvroOcfFormat>(Vec::new())
+                                    .expect("create writer")
+                            },
+                            |mut writer| {
+                                for _ in 0..BATCHES {
+                                    writer.write(&batch).expect("write batch");
+                                }
+                                // `into_inner` flushes the pending block itself.
+                                writer.into_inner()
+                            },
+                            BatchSize::SmallInput,
+                        )
+                    },
+                );
+            }
+        }
+    }
+    group.finish();
+}
+
+/// Writing a small file: one batch, one block, `finish`. This is the case where the staging
+/// buffer sized for a whole block is mostly unused, so it shows what that reservation costs a
+/// writer that never fills it.
+fn bench_small_ocf_file(c: &mut Criterion) {
+    let mut group = c.benchmark_group("write-ocf-small-file");
+    for (label, rows) in [("3-rows", 3), ("1k-rows", 1_024)] {
+        let batch = block_size_batch(rows, true);
+        group.bench_function(label, |b| {
+            b.iter(|| {
+                let mut writer = AvroWriter::new(Vec::new(), batch.schema().as_ref().clone())
+                    .expect("create writer");
+                writer.write(&batch).expect("write batch");
+                writer.into_inner().expect("flush writer")
+            });
+        });
+    }
+    group.finish();
+}
+
 fn criterion_benches(c: &mut Criterion) {
+    bench_block_size(c);
+    bench_small_ocf_file(c);
     bench_writer_scenario(c, "write-Boolean", &BOOLEAN_DATA);
     bench_writer_scenario(c, "write-Int32", &INT32_DATA);
     bench_writer_scenario(c, "write-Int64", &INT64_DATA);

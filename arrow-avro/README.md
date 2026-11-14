@@ -86,7 +86,7 @@ fn main() -> anyhow::Result<()> {
     let mut w = AvroWriter::new(sink, schema)?;
     w.write(&batch)?;
     w.finish()?;
-    assert!(!w.into_inner().is_empty());
+    assert!(!w.into_inner()?.is_empty());
     Ok(())
 }
 ```

@@ -42,7 +42,7 @@
 //! let mut w = AvroWriter::new(sink, schema.clone())?;
 //! w.write(&batch)?;
 //! w.finish()?;
-//! let bytes = w.into_inner();
+//! let bytes = w.into_inner()?;
 //! assert!(!bytes.is_empty());
 //!
 //! // Read it back
@@ -137,7 +137,7 @@
 //!     .build(sink)?;
 //! w.write(&batch)?;
 //! w.finish()?;
-//! let frame = w.into_inner(); // already: C3 01 + 8B LE Rabin + Avro body
+//! let frame = w.into_inner()?; // already: C3 01 + 8B LE Rabin + Avro body
 //! assert!(frame.len() > 10);
 //!
 //! // Decode

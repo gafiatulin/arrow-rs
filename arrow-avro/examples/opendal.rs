@@ -29,9 +29,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut writer = AvroWriter::new(Vec::new(), batch.schema().as_ref().clone())?;
     writer.write(&batch)?;
-    // Flush the final Avro block before uploading the complete file.
-    writer.finish()?;
-    operator.write(path, writer.into_inner()).await?;
+    // Handing the buffer back flushes the final Avro block before the upload.
+    operator.write(path, writer.into_inner()?).await?;
 
     let file_size = operator.stat(path).await?.content_length();
     let reader = OpenDalReader(operator.reader(path).await?);

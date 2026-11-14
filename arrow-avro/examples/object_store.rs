@@ -44,7 +44,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     writer.write(&batch)?;
     writer.finish()?;
     store
-        .put(&path, Bytes::from(writer.into_inner()).into())
+        .put(&path, Bytes::from(writer.into_inner()?).into())
         .await?;
 
     // 2. Read it back with an `AsyncFileReader` implemented on `ObjectStore`.
