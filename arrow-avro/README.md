@@ -124,6 +124,38 @@ storage services (S3, GCS, Azure Blob, etc.) can be integrated by implementing
 `AsyncFileReader` on top of a client such as the [`object_store`] crate. See
 the example on the `AsyncFileReader` trait documentation.
 
+### Async writing (`async` feature)
+
+`AsyncAvroWriter` mirrors the synchronous writer. Any `tokio::io::AsyncWrite`
+sink works out of the box, and remote storage is a matter of implementing
+`AsyncFileWriter` (three methods: `write`, `complete`, `abort`).
+
+```rust,ignore
+use arrow_avro::writer::{AsyncAvroWriter, WriterBuilder};
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    let file = tokio::fs::File::create("data/example.avro").await?;
+
+    let mut writer = AsyncAvroWriter::new(file, schema).await?;
+    writer.write(&batch).await?;
+    writer.finish().await?;
+    Ok(())
+}
+```
+
+OCF blocks are accumulated until they reach `DEFAULT_OCF_BLOCK_SIZE` (64 KiB by default), which
+is what makes compression pay off; tune it with
+`WriterBuilder::with_block_size`, or disable it with
+`WriterBuilder::without_block_buffering()` to bound the writer's memory to one batch.
+`WriterBuilder::build_async` accepts the same configuration as `build`. `AsyncWriter::flush()`
+emits a partially filled block on demand, for callers that would rather not wait for the target.
+
+Because rows are staged, an OCF writer must be finished: call `finish()`, or `into_inner()` when
+you also want the sink back — both flush the pending block and report I/O errors. A writer that
+is dropped instead loses the block still staged, and `abort()` is the error-path exit for sinks
+that hold upload state. Stream writers (`AsyncAvroStreamWriter`) stage nothing.
+
 [`object_store`]: https://docs.rs/object_store/latest/object_store/
 
 ---
@@ -153,7 +185,7 @@ the example on the `AsyncFileReader` trait documentation.
 
 | Feature        | Default | What it enables                                                             | When to use                                                                   |
 |----------------|--------:|-----------------------------------------------------------------------------|-------------------------------------------------------------------------------|
-| `async`        |       ⬜ | Async APIs for reading Avro via `futures` and `tokio`                       | Enable for non-blocking async Avro reading with `AsyncAvroFileReader`, including from cloud storage via a custom `AsyncFileReader`. |
+| `async`        |       ⬜ | Async APIs for reading **and writing** Avro via `futures` and `tokio`        | Enable for non-blocking Avro I/O: `AsyncAvroFileReader` for reading, `AsyncAvroWriter` for writing, both extendable to cloud storage by implementing `AsyncFileReader` / `AsyncFileWriter`. |
 | `object_store` |       ⬜ | **Deprecated**: the deprecated `AvroObjectReader` (implies `async`)         | Do not enable in new code; implement `AsyncFileReader` directly instead. Will be removed in a future release. |
 
 ### Schema fingerprints & custom logical type helpers

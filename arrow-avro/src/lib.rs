@@ -184,6 +184,32 @@
 //! # }
 //! ```
 //!
+//! ## `async` Writing (`async` feature)
+//!
+//! The [`writer`] module mirrors the same formats asynchronously: `AsyncAvroWriter` writes
+//! **OCF** and `AsyncAvroStreamWriter` writes **SOE** streams, both configured through
+//! [`WriterBuilder`](writer::WriterBuilder) and built with its `build_async` method. Any
+//! [`AsyncWrite`](tokio::io::AsyncWrite) sink works as is; cloud storage services can be
+//! integrated by implementing `AsyncFileWriter` (three methods: `write`, `complete`, `abort`),
+//! as in the example on the trait documentation and in `arrow-avro/examples/object_store.rs`.
+//!
+//! ```ignore
+//! use arrow_avro::writer::AsyncAvroWriter;
+//!
+//! # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+//! let file = tokio::fs::File::create("data/example.avro").await?;
+//!
+//! let mut writer = AsyncAvroWriter::new(file, schema).await?;
+//! writer.write(&batch).await?;
+//! writer.finish().await?;
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! An OCF writer buffers encoded rows into blocks of `DEFAULT_OCF_BLOCK_SIZE` (64 KiB) by
+//! default, so call `finish()` when done — `flush()` emits a partially filled block and keeps
+//! the writer usable — and `abort()` on the error path.
+//!
 //! [object_store]: https://docs.rs/object_store/latest/object_store/
 //!
 //! ---
@@ -194,6 +220,8 @@
 //!   - With the `async` feature: [`AsyncAvroFileReader`] for async streaming reads,
 //!     from any [`AsyncFileReader`] source including cloud object storage.
 //! - [`writer`]: write Arrow `RecordBatch`es as Avro (OCF, SOE, Confluent, Apicurio).
+//!   - With the `async` feature: `AsyncAvroWriter` / `AsyncAvroStreamWriter` write the same
+//!     formats to any `AsyncFileWriter` sink, including cloud object storage.
 //! - [`schema`]: Avro schema parsing / fingerprints / registries.
 //! - [`compression`]: codecs used for **OCF block compression** (i.e., Deflate, Snappy, Zstandard, BZip2, and XZ).
 //! - [`codec`]: internal Avro-Arrow type conversion and row decode/encode plans.
@@ -211,9 +239,10 @@
 //! - `xz` — enable XZ/LZMA block compression.
 //!
 //! **Async (opt‑in)**
-//! - `async` — enable async APIs for reading Avro (`AsyncAvroFileReader`, `AsyncFileReader` trait).
-//!   Cloud storage (S3, GCS, Azure Blob, etc.) can be integrated by implementing
-//!   `AsyncFileReader` on top of a client such as the [`object_store`] crate.
+//! - `async` — enable async APIs for reading **and writing** Avro (`AsyncAvroFileReader`,
+//!   `AsyncFileReader`, `AsyncAvroWriter`, `AsyncFileWriter`). Cloud storage (S3, GCS, Azure
+//!   Blob, etc.) can be integrated by implementing `AsyncFileReader` / `AsyncFileWriter` on top
+//!   of a client such as the [`object_store`] crate.
 //! - `object_store` (**deprecated**): enables the deprecated `AvroObjectReader`.
 //!   Implement `AsyncFileReader` directly instead (see above). Implies `async`.
 //!   This feature will be removed in a future release.

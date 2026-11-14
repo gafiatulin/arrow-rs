@@ -23,6 +23,11 @@
 //!   Ideal for publishing individual messages to Kafka, Pulsar, or other message queues
 //!   where each message must be a self-contained Avro payload.
 //!
+//! * **`AsyncAvroWriter`** / **`AsyncAvroStreamWriter`** — the `async` versions of the first two,
+//!   which write the same formats into an `AsyncFileWriter` sink such as a file, a socket or a
+//!   multipart upload. Configure them through the same
+//!   [`WriterBuilder`](crate::writer::WriterBuilder).
+//!
 //! ## Which writer should you use?
 //!
 //! | Use Case | Recommended Type |
@@ -38,7 +43,8 @@
 //! OCF writers accumulate encoded rows and emit a block once it reaches
 //! [`DEFAULT_OCF_BLOCK_SIZE`](crate::writer::DEFAULT_OCF_BLOCK_SIZE) bytes (64 KiB by default)
 //! rather than one block per [`arrow_array::RecordBatch`]. Larger blocks compress better and cut
-//! per-block framing; smaller ones shorten the wait before a reader can see rows. Tune the target with
+//! per-block framing; smaller ones shorten the wait before a reader can see rows, and `flush()`
+//! on the `async` writer emits the pending block immediately. Tune the target with
 //! [`WriterBuilder::with_block_size`](crate::writer::WriterBuilder::with_block_size), or emit one
 //! block per write with
 //! [`WriterBuilder::without_block_buffering`](crate::writer::WriterBuilder::without_block_buffering).
@@ -173,6 +179,13 @@ use std::sync::Arc;
 mod encoder;
 /// Logic for different Avro container file formats.
 pub mod format;
+
+/// Async Avro writer API
+#[cfg(feature = "async")]
+pub mod async_writer;
+
+#[cfg(feature = "async")]
+pub use async_writer::{AsyncAvroStreamWriter, AsyncAvroWriter, AsyncFileWriter, AsyncWriter};
 
 /// A contiguous set of Avro encoded rows.
 ///
@@ -337,7 +350,10 @@ pub const DEFAULT_OCF_BLOCK_SIZE: usize = 64 * 1024;
 /// Initial capacity for the OCF block staging buffer.
 ///
 /// `block_size` is a threshold rather than a promise that much data arrives, so the buffer is
-/// only sized for a default-size block up front and grows on demand past that.
+/// only sized for a default-size block up front and grows on demand past that. Sizing it for a
+/// block is cheap even for a writer that never fills one — starting small instead measures within
+/// the noise on both `write-ocf-small-file` cases — and it saves a writer that does fill blocks
+/// from regrowing, which costs more than the reservation ever does.
 fn staging_capacity(capacity: usize, block_size: usize) -> usize {
     capacity.max(block_size.min(DEFAULT_OCF_BLOCK_SIZE))
 }
@@ -565,7 +581,8 @@ impl WriterBuilder {
     /// The writer accumulates encoded rows into a staging buffer and emits a new OCF block
     /// once the buffer reaches this size, rather than flushing one block per [`RecordBatch`].
     /// Larger blocks improve compression ratios and reduce per-block framing overhead, while
-    /// smaller blocks reduce read latency for filtered scans.
+    /// smaller blocks reduce read latency for filtered scans. The `async` writer's `flush()` emits
+    /// a partially filled block on demand, for callers that would rather not wait for the target.
     ///
     /// The default is [`DEFAULT_OCF_BLOCK_SIZE`] (64 KiB), the same order as the block size Avro
     /// Java picks by default; see its documentation for why the exact value does not matter.
@@ -700,6 +717,61 @@ impl WriterBuilder {
             blocks_written: 0,
             failed: false,
         })
+    }
+
+    /// Build an asynchronous [`AsyncWriter`] with the specified [`AvroFormat`].
+    ///
+    /// This is the async counterpart of [`build`](Self::build); all builder settings
+    /// (compression, capacity, block size, fingerprint strategy) apply identically.
+    ///
+    /// The schema, the encoder and the sync marker are validated before the sink is
+    /// touched, so a rejected configuration leaves nothing behind. The header itself is
+    /// written here, though, and the sink is gone if that write fails: a failure from
+    /// this method can leave a partial header on a sink that holds upload state (an
+    /// `object_store` multipart upload, say), and there is no handle left to
+    /// [`abort`](AsyncFileWriter::abort) it with.
+    #[cfg(feature = "async")]
+    pub async fn build_async<W, F>(self, mut writer: W) -> Result<AsyncWriter<W, F>, AvroError>
+    where
+        W: AsyncFileWriter,
+        F: AvroFormat,
+    {
+        let mut format = F::default();
+        if !F::IS_BLOCK_FRAMED && !F::NEEDS_PREFIX {
+            return Err(AvroError::InvalidArgument(
+                "AvroBinaryFormat is only supported with Encoder, use build_encoder instead"
+                    .to_string(),
+            ));
+        }
+        let (schema, encoder) = self.prepare_encoder::<F>()?;
+        // Compose the header bytes synchronously, then push to the async sink. The
+        // encoder is already validated above, so this is the only sink write that can
+        // fail while the caller does not yet own the writer - and it consumes the sink,
+        // which is why the method documents it.
+        let mut header_buf = Vec::<u8>::with_capacity(256);
+        format.start_stream(&mut header_buf, &schema, self.codec)?;
+        // The OCF format generates its marker inside `start_stream`, so read it afterwards.
+        let sync = if F::IS_BLOCK_FRAMED {
+            Some(format.sync_marker().copied().ok_or_else(|| {
+                AvroError::InvalidArgument(
+                    "block-framed formats must provide a sync marker".to_string(),
+                )
+            })?)
+        } else {
+            None
+        };
+        if !header_buf.is_empty() {
+            writer.write(bytes::Bytes::from(header_buf)).await?;
+        }
+        Ok(AsyncWriter::from_parts(
+            writer,
+            schema,
+            sync,
+            self.leveled_codec(),
+            self.block_size,
+            self.capacity,
+            encoder,
+        ))
     }
 }
 
@@ -853,7 +925,8 @@ pub struct Writer<W: Write, F: AvroFormat> {
 
 /// Counters describing what a writer has written.
 ///
-/// Queryable at any time via [`Writer::stats`]; after `finish()` they include the final block.
+/// Queryable at any time via [`Writer::stats`], and via `AsyncWriter::stats` on the `async`
+/// writer; after `finish()` they include the final block.
 ///
 /// `blocks_written` is meaningful only for the OCF format; SOE / binary
 /// streams report `0`.
@@ -1041,11 +1114,29 @@ impl<W: Write, F: AvroFormat> Writer<W, F> {
         Ok(())
     }
 
+    /// Bytes staged for the current OCF block, waiting for [`finish`](Self::finish) or a write
+    /// that fills it. Always `0` for stream formats.
+    pub fn in_progress_size(&self) -> usize {
+        self.block.bytes().len()
+    }
+
+    /// Rows staged for the current OCF block. Always `0` for stream formats.
+    pub fn in_progress_rows(&self) -> usize {
+        self.block.rows()
+    }
+
     /// Flush any pending OCF block and the underlying writer.
     ///
     /// This emits any rows accumulated by [`with_block_size`](WriterBuilder::with_block_size)
     /// that have not yet reached the configured block-size threshold, then flushes
     /// the underlying [`Write`]. Use [`stats`](Self::stats) for the counters afterwards.
+    ///
+    /// It is *not* final, and it stays usable: nothing is written after the last block, so more
+    /// batches can follow and `finish` can be called again before
+    /// [`into_inner`](Self::into_inner) takes the output object. In other words this is the
+    /// `async` writer's `flush()`, not its `finish()`, which completes the sink and rejects
+    /// further writes. A synchronous `Write` has no equivalent of that, because releasing it is
+    /// [`into_inner`](Self::into_inner)'s job.
     ///
     /// Rows staged in an in-progress block are lost if the writer is dropped without calling
     /// this method.
@@ -1068,6 +1159,11 @@ impl<W: Write, F: AvroFormat> Writer<W, F> {
             return Err(sink_failed_error());
         }
         Ok(())
+    }
+
+    /// Returns the Arrow schema (with `avro.schema` metadata) this writer was built with.
+    pub fn schema(&self) -> SchemaRef {
+        self.schema.clone()
     }
 
     /// Snapshot of the writer's counters, queryable at any time.
@@ -1107,6 +1203,8 @@ impl<W: Write, F: AvroFormat> Writer<W, F> {
     /// Emit the currently accumulated OCF block, applying compression and writing
     /// header (row count + byte count), block bytes, and sync marker.
     /// No-op if no rows are accumulated.
+    ///
+    /// The async writer's `flush_block` does the same work against a sink; keep the two in step.
     fn flush_block(&mut self, sync: &[u8; 16]) -> Result<(), AvroError> {
         if self.block.is_empty() {
             return Ok(());
@@ -1159,6 +1257,7 @@ mod tests {
     use crate::schema::AVRO_NAME_METADATA_KEY;
     use crate::schema::{AvroSchema, SchemaStore};
     use crate::test_util::arrow_test_data;
+    use crate::writer::encoder::write_long;
     use arrow::datatypes::TimeUnit;
     use arrow::util::pretty::pretty_format_batches;
     #[cfg(not(feature = "avro_custom_types"))]
@@ -1652,8 +1751,6 @@ mod tests {
         Ok(())
     }
 
-    /// A format that claims block framing must produce a sync marker; the writer checks that when
-    /// it is built rather than panicking mid-stream.
     /// Only block-framed writers stage rows, so only they reserve a block buffer.
     #[test]
     fn test_block_buffer_is_only_allocated_for_block_framed_formats() {
@@ -1695,6 +1792,8 @@ mod tests {
         }
     }
 
+    /// A format that claims block framing must produce a sync marker; the writer checks that when
+    /// it is built rather than panicking mid-stream.
     #[test]
     fn test_block_framed_format_requires_a_sync_marker() {
         let err = WriterBuilder::new(make_schema())
@@ -1815,6 +1914,182 @@ mod tests {
             after_failure,
             "the partial output is not extended by the failed flush"
         );
+        Ok(())
+    }
+
+    /// Each compressed block is decoded on its own, so fill several of them and read every row
+    /// back.
+    #[cfg(feature = "deflate")]
+    #[test]
+    fn test_multiple_compressed_blocks_round_trip() -> Result<(), AvroError> {
+        let batch = make_batch();
+        let tiny_block = NonZeroUsize::new(64).expect("non-zero block size");
+        let mut writer = WriterBuilder::new(make_schema())
+            .with_compression(Some(CompressionCodec::Deflate))
+            .with_block_size(tiny_block)
+            .build::<_, AvroOcfFormat>(Vec::<u8>::new())?;
+        for _ in 0..32 {
+            writer.write(&batch)?;
+        }
+        let blocks = writer.stats().blocks_written;
+        assert!(blocks > 1, "expected several blocks, wrote {blocks}");
+
+        let reader = crate::reader::ReaderBuilder::new()
+            .build(std::io::Cursor::new(writer.into_inner()?))?;
+        let mut rows = 0;
+        for batch in reader {
+            rows += batch?.num_rows();
+        }
+        assert_eq!(rows, 32 * batch.num_rows());
+        Ok(())
+    }
+
+    /// The `in_progress_*` accessors track what is staged, which `stats()` alone cannot show.
+    #[test]
+    fn test_in_progress_accessors_track_the_staged_block() -> Result<(), AvroError> {
+        let mut writer = AvroWriter::new(Vec::<u8>::new(), make_schema())?;
+        assert_eq!(writer.in_progress_rows(), 0);
+        assert_eq!(writer.in_progress_size(), 0);
+
+        let batch = make_batch();
+        writer.write(&batch)?;
+        assert_eq!(writer.in_progress_rows(), batch.num_rows());
+        assert!(writer.in_progress_size() > 0);
+
+        writer.finish()?;
+        assert_eq!(writer.in_progress_rows(), 0, "finish emitted the block");
+        assert_eq!(writer.in_progress_size(), 0);
+        assert_eq!(writer.stats().rows_accepted, batch.num_rows() as u64);
+        Ok(())
+    }
+
+    /// A block goes out on the write that crosses the target, not on `finish`: the counters have
+    /// to account for rows while the writer is still being fed.
+    #[test]
+    fn test_block_is_emitted_by_the_write_that_fills_it() -> Result<(), AvroError> {
+        let batch = make_batch();
+        let target = NonZeroUsize::new(64).expect("non-zero block size");
+        let mut writer = WriterBuilder::new(make_schema())
+            .with_block_size(target)
+            .build::<_, AvroOcfFormat>(Vec::<u8>::new())?;
+
+        let mut writes = 0;
+        while writer.stats().blocks_written == 0 {
+            writer.write(&batch)?;
+            writes += 1;
+            assert!(writes < 16, "the target was never reached");
+        }
+        assert!(
+            writes > 1,
+            "one batch is smaller than the target, so the block fills over several writes"
+        );
+        assert_eq!(
+            writer.stats().rows_accepted,
+            (writes * batch.num_rows()) as u64,
+            "the rows left with the block, before `finish`"
+        );
+
+        writer.finish()?;
+        let reader = crate::reader::ReaderBuilder::new()
+            .build(std::io::Cursor::new(writer.into_inner()?))?;
+        let mut decoded = 0;
+        for batch in reader {
+            decoded += batch?.num_rows();
+        }
+        assert_eq!(decoded, writes * batch.num_rows());
+        Ok(())
+    }
+
+    /// Every level setter has to reach the codec the writer compresses with, not just deflate's.
+    ///
+    /// The payload is 256 KiB of structured-but-not-trivial integers held in one block, which is
+    /// what it takes for all three codecs to produce a different size at their weakest and
+    /// strongest settings; below that, zstd and bzip2 converge and cannot tell the levels apart.
+    #[cfg(any(feature = "zstd", feature = "bzip2", feature = "xz"))]
+    #[test]
+    fn test_builder_levels_reach_every_codec() -> Result<(), AvroError> {
+        let schema = Schema::new(vec![Field::new("v", DataType::Int64, false)]);
+        let mut x: u64 = 0x2545_F491_4F6C_DD1D;
+        let values: Vec<i64> = (0..131_072)
+            .map(|_| {
+                x = x
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1_442_695_040_888_963_407);
+                ((x >> 40) % 4096) as i64
+            })
+            .collect();
+        let batch = RecordBatch::try_new(
+            Arc::new(schema.clone()),
+            vec![Arc::new(Int64Array::from(values)) as ArrayRef],
+        )?;
+        let one_block = NonZeroUsize::new(2 * 1024 * 1024).expect("non-zero block size");
+        let write = |builder: WriterBuilder| -> Result<Vec<u8>, AvroError> {
+            let mut writer = builder.build::<_, AvroOcfFormat>(Vec::<u8>::new())?;
+            writer.write(&batch)?;
+            writer.into_inner()
+        };
+        let base = || WriterBuilder::new(schema.clone()).with_block_size(one_block);
+
+        #[cfg(feature = "zstd")]
+        {
+            let fast = write(
+                base()
+                    .with_compression(Some(CompressionCodec::ZStandard))
+                    .with_zstd_level(ZstdLevel::try_new(1)?),
+            )?;
+            let best = write(
+                base()
+                    .with_compression(Some(CompressionCodec::ZStandard))
+                    .with_zstd_level(ZstdLevel::try_new(19)?),
+            )?;
+            assert!(
+                best.len() < fast.len(),
+                "zstd level not applied: {} vs {}",
+                best.len(),
+                fast.len()
+            );
+        }
+
+        #[cfg(feature = "bzip2")]
+        {
+            let fast = write(
+                base()
+                    .with_compression(Some(CompressionCodec::Bzip2))
+                    .with_bzip2_level(Bzip2Level::try_new(1)?),
+            )?;
+            let best = write(
+                base()
+                    .with_compression(Some(CompressionCodec::Bzip2))
+                    .with_bzip2_level(Bzip2Level::try_new(9)?),
+            )?;
+            assert!(
+                best.len() < fast.len(),
+                "bzip2 level not applied: {} vs {}",
+                best.len(),
+                fast.len()
+            );
+        }
+
+        #[cfg(feature = "xz")]
+        {
+            let fast = write(
+                base()
+                    .with_compression(Some(CompressionCodec::Xz))
+                    .with_xz_level(XzLevel::try_new(0)?),
+            )?;
+            let best = write(
+                base()
+                    .with_compression(Some(CompressionCodec::Xz))
+                    .with_xz_level(XzLevel::try_new(9)?),
+            )?;
+            assert!(
+                best.len() < fast.len(),
+                "xz level not applied: {} vs {}",
+                best.len(),
+                fast.len()
+            );
+        }
+
         Ok(())
     }
 
