@@ -454,10 +454,11 @@ impl WriterBuilder {
 
     /// Build a new [`Encoder`] for the given [`AvroFormat`].
     ///
-    /// `Encoder` only supports stream formats (no OCF sync markers). Attempting to build an
-    /// encoder with an OCF format (e.g. [`AvroOcfFormat`]) will return an error.
+    /// `Encoder` only supports stream formats. Attempting to build an encoder with a
+    /// block-framed format (e.g. [`AvroOcfFormat`]) will return an error, matching the check
+    /// [`build`](Self::build) applies in the other direction.
     pub fn build_encoder<F: AvroFormat>(self) -> Result<Encoder, AvroError> {
-        if F::default().sync_marker().is_some() {
+        if F::IS_BLOCK_FRAMED {
             return Err(AvroError::InvalidArgument(
                 "Encoder only supports stream formats (no OCF header/sync marker)".to_string(),
             ));
@@ -479,7 +480,7 @@ impl WriterBuilder {
         F: AvroFormat,
     {
         let mut format = F::default();
-        if format.sync_marker().is_none() && !F::NEEDS_PREFIX {
+        if !F::IS_BLOCK_FRAMED && !F::NEEDS_PREFIX {
             return Err(AvroError::InvalidArgument(
                 "AvroBinaryFormat is only supported with Encoder, use build_encoder instead"
                     .to_string(),
@@ -1269,6 +1270,49 @@ mod tests {
         let out = writer.into_inner();
         assert_eq!(&out[..4], b"Obj\x01", "finish() should emit OCF header");
         Ok(())
+    }
+
+    /// Declares block framing but never produces a sync marker: the shape `build` and
+    /// `build_encoder` both have to reject.
+    #[derive(Debug, Default)]
+    struct MarkerlessFormat;
+
+    impl AvroFormat for MarkerlessFormat {
+        const NEEDS_PREFIX: bool = false;
+        const IS_BLOCK_FRAMED: bool = true;
+
+        fn start_stream<W: Write>(
+            &mut self,
+            _writer: &mut W,
+            _schema: &Schema,
+            _compression: Option<CompressionCodec>,
+        ) -> Result<(), AvroError> {
+            Ok(())
+        }
+
+        fn sync_marker(&self) -> Option<&[u8; 16]> {
+            None
+        }
+    }
+
+    /// `build_encoder` and `build` must decide framing the same way. The predicate is
+    /// `IS_BLOCK_FRAMED`, not whether the format happens to return a sync marker, so a
+    /// block-framed format with no marker is rejected here rather than slipping through.
+    #[test]
+    fn test_build_encoder_rejects_block_framed_formats() {
+        let ocf = WriterBuilder::new(make_schema())
+            .build_encoder::<AvroOcfFormat>()
+            .unwrap_err();
+        let markerless = WriterBuilder::new(make_schema())
+            .build_encoder::<MarkerlessFormat>()
+            .unwrap_err();
+        for err in [ocf, markerless] {
+            assert!(
+                err.to_string()
+                    .contains("Encoder only supports stream formats"),
+                "unexpected error: {err}"
+            );
+        }
     }
 
     #[test]

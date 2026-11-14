@@ -20,6 +20,23 @@ pub trait AvroFormat: Debug + Default {
     /// skip this step. This is a performance hint for the writer.
     const NEEDS_PREFIX: bool;
 
+    /// Whether records are framed into blocks separated by [`Self::sync_marker`].
+    ///
+    /// [`AvroOcfFormat`] is the only format that does this; stream formats write each record
+    /// straight to the sink. A block-framed format must return a sync marker, which the writers
+    /// check when they are built.
+    ///
+    /// This is a const rather than a question asked of `sync_marker()` because the writers have
+    /// to answer it twice before a format object has produced anything: [`WriterBuilder::build`]
+    /// decides whether the format can write at all and how much to stage, and
+    /// [`WriterBuilder::build_encoder`] rejects block framing outright. Asking `sync_marker()`
+    /// there would mean constructing a format and reading a marker it has not generated yet, so a
+    /// format that frames without producing one would slip through with no marker or no framing.
+    ///
+    /// [`WriterBuilder::build`]: crate::writer::WriterBuilder::build
+    /// [`WriterBuilder::build_encoder`]: crate::writer::WriterBuilder::build_encoder
+    const IS_BLOCK_FRAMED: bool = false;
+
     /// Write any bytes required at the very beginning of the output stream
     /// (file header, etc.).
     /// Implementations **must not** write any record data.
@@ -31,6 +48,8 @@ pub trait AvroFormat: Debug + Default {
     ) -> Result<(), AvroError>;
 
     /// Return the 16‑byte sync marker (OCF) or `None` (binary stream).
+    ///
+    /// Required when [`Self::IS_BLOCK_FRAMED`] is `true`, and ignored otherwise.
     fn sync_marker(&self) -> Option<&[u8; 16]>;
 }
 
@@ -42,6 +61,7 @@ pub struct AvroOcfFormat {
 
 impl AvroFormat for AvroOcfFormat {
     const NEEDS_PREFIX: bool = false;
+    const IS_BLOCK_FRAMED: bool = true;
     fn start_stream<W: Write>(
         &mut self,
         writer: &mut W,
